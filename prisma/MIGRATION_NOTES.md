@@ -1,75 +1,65 @@
-# Prisma Schema Migration Notes
+# Prisma Migration Notes
 
-## [Unreleased] — Add `StockItem.reservedOrderId`
+## Schema
 
-### Context
-The stock reservation/release flow previously released stock only by `productId`,
-which is unsafe when multiple concurrent orders reserve stock for the same product.
-To scope reservations per-order, a new optional field `reservedOrderId` is added to
-`StockItem`. It stores the ID of the `Order` that the row is currently reserved for.
+Both `prisma/schema.prisma` (Next.js app) and `mini-services/tg-bot/prisma/schema.prisma` (bot service) are **byte-identical** and use `provider = "postgresql"`.
 
-### Schema change
-
-In both `prisma/schema.prisma` (root, Next.js app) and
-`mini-services/tg-bot/prisma/schema.prisma` (Telegram bot), the `StockItem` model
-receives:
+## Field added: `StockItem.reservedOrderId`
 
 ```prisma
 model StockItem {
-  // ... existing fields ...
-  reservedOrderId String?   // ID заказа, под который зарезервирован (для scoped release)
-
-  @@index([productId, status])
+  ...
+  reservedOrderId String?   // ID заказа, под который зарезервирован
   @@index([reservedOrderId])
 }
 ```
 
-Both schema files MUST stay byte-identical so the Next.js app and the Telegram
-bot share the same Prisma Client shape against the same database.
+### Why
+Previous code released reserved stock by `productId + status:"reserved"` — this could release another order's reserved stock on cancel. Now release is scoped by `reservedOrderId`.
 
-### Migration path (non-destructive, additive)
+### Migration impact
+- Existing `reserved` rows (if any) will have `reservedOrderId = null`.
+- The old productId-based release code is replaced; null-`reservedOrderId` reserved rows from before this change can be released manually:
+  ```sql
+  UPDATE "StockItem" SET status = 'available' WHERE status = 'reserved' AND "reservedOrderId" IS NULL;
+  ```
+- `sold` and `available` rows are unaffected.
 
-- Field is **nullable** and has **no default** — additive change, safe for
-  `prisma db push` / `prisma migrate deploy` against existing data.
-- Existing rows with `status = "reserved"` will get `reservedOrderId = NULL`.
-  This is acceptable: legacy `reserved` rows can still be released by the old
-  `productId`-based fallback logic, or released manually.
-- New reservations SHOULD set `reservedOrderId = <order.id>` at reserve time so
-  the scoped release (`WHERE reservedOrderId = <order.id>`) only touches rows
-  that belong to that specific order.
-- A new index `@@index([reservedOrderId])` supports efficient
-  `WHERE reservedOrderId = ?` lookups during scoped release.
+## Database provider
 
-### Deploy steps
+Schema is locked to `postgresql`. If you need SQLite for local development:
+1. Either install Postgres locally (`docker run -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16`)
+2. Or maintain a separate `schema.sqlite.prisma` and run `prisma db push --schema schema.sqlite.prisma`
 
-1. Pull the updated schema files.
-2. From the project root run:
-   ```bash
-   npm run db:push      # or: npm run db:migrate  (prisma migrate deploy)
-   npm run db:generate  # regenerate Prisma Client
-   ```
-3. From `mini-services/tg-bot/` run:
-   ```bash
-   npm run db:push
-   npm run db:generate
-   ```
-4. Restart both the Next.js app and the Telegram bot so they pick up the
-   regenerated Prisma Client.
+**Do NOT** sed-rewrite `schema.prisma` at runtime (was fragile, broke reproducibility — removed).
 
-### Backward compatibility / fallback
+## Workflow
 
-Code that releases stock may keep a fallback path: if `reservedOrderId` is NULL
-on a reserved row, fall back to releasing by `productId`. This keeps old
-reservations working without a data backfill.
-
-### Rollback
-
-Drop the column and index:
-
-```sql
-ALTER TABLE "StockItem" DROP COLUMN "reservedOrderId";
-DROP INDEX IF EXISTS "StockItem_reservedOrderId_idx";
+### Local development
+```bash
+bun install                              # root
+npx prisma generate                      # generate client
+npx prisma db push                       # create/sync tables (dev only)
+bun run db:seed                          # seed initial data (idempotent)
 ```
 
-No data loss occurs because `reservedOrderId` is derived state, not authoritative
-order data.
+### Production (Railway)
+- `deploy/railway/build-admin.sh` runs: `npm install` → `prisma generate` → `prisma db push --skip-generate` → `tsx prisma/seed.ts` → `tsx prisma/seed-additional.ts` → `npm run build`
+- `mini-services/tg-bot/build-railway.sh` runs: `npm install --omit=dev` → `prisma generate`
+- `mini-services/tg-bot/start.sh` runs `prisma db push --skip-generate` at startup (creates tables if missing)
+- Seeds are idempotent — safe to run on every deploy (skip if already applied)
+
+### When to use `prisma migrate` instead of `db push`
+Once you have **production data**, switch to migrations:
+```bash
+bun run db:migrate                       # applies pending migrations from prisma/migrations/
+```
+For now, no migration files exist — `db push` is used. The first schema-affecting change in production should create the initial migration baseline:
+```bash
+npx prisma migrate dev --name init       # locally, against a dev DB
+npx prisma migrate resolve --applied     # mark baseline as applied on prod
+```
+
+## Prisma version
+
+Both `package.json` (root) and `mini-services/tg-bot/package.json` use `prisma` + `@prisma/client` `^6.11.1` — keep them in sync. Earlier the bot used `^5.22.0` which generated an incompatible client.

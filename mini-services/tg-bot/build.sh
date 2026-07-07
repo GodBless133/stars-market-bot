@@ -3,12 +3,10 @@ set -e
 
 echo "🚂 [bot] Railway build..."
 
-DB_URL="${DATABASE_URL:-}"
-if echo "$DB_URL" | grep -q "^postgres"; then
-  echo "→ switching schema to postgresql"
-  sed -i 's|provider = "sqlite"|provider = "postgresql"|g' prisma/schema.prisma
-fi
-
+# Generate Prisma client. Schema declares provider = "postgresql" — must match DATABASE_URL.
+# No runtime sed-rewrites of schema.prisma (was fragile, broke reproducibility).
+echo "🔧 prisma generate..."
 bunx prisma generate
 
-echo "✅ [bot] build complete — tables will be created at startup"
+# Tables are created at startup via `prisma db push` in start.sh
+echo "✅ [bot] build complete — tables will be created at startup (start.sh)"
