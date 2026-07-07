@@ -1,0 +1,45 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+bun.lockb
+
+# next.js build output
+.next/
+out/
+build/
+dist/
+
+# production
+*.tsbuildinfo
+
+# env files (secrets!)
+.env
+.env.*
+!.env.example
+
+# database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+prisma/*.db
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# misc
+.cache/
+coverage/
+*.pem

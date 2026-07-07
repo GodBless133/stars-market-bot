@@ -1,0 +1,21 @@
+{
+  "name": "tg-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bash start.sh",
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate"
+  },
+  "dependencies": {
+    "grammy": "^1.44.0",
+    "@prisma/client": "^5.22.0",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

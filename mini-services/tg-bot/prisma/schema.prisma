@@ -1,0 +1,156 @@
+// Prisma schema — Telegram Stars & Accounts Store
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String
+  slug        String    @unique
+  description String?
+  icon        String?
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  products    Product[]
+}
+
+model Product {
+  id          String      @id @default(cuid())
+  title       String
+  slug        String      @unique
+  description String
+  longDesc    String?
+  price       Float
+  oldPrice    Float?
+  currency    String      @default("RUB")
+  image       String?
+  gallery     String?
+  categoryId  String
+  category    Category    @relation(fields: [categoryId], references: [id])
+  type        String      @default("digital") // digital | stars | account | service
+  badge       String?
+  rating      Float       @default(0)
+  salesCount  Int         @default(0)
+  featured    Boolean     @default(false)
+  active      Boolean     @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  stock       StockItem[]
+  orderItems  OrderItem[]
+  reviews     Review[]
+
+  @@index([categoryId])
+  @@index([featured])
+  @@index([active])
+}
+
+model StockItem {
+  id          String    @id @default(cuid())
+  productId   String
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  content     String    // общие данные выдачи (для не-аккаунтов)
+  status      String    @default("available") // available | reserved | sold
+  createdAt   DateTime  @default(now())
+  soldAt      DateTime?
+  
+  // Поля для аккаунтов (null для других типов товаров)
+  phone       String?   // номер телефона аккаунта
+  password    String?   // пароль аккаунта (cloud password)
+  twoFA       String?   // 2FA пароль
+  sessionFile String?   // путь к .session файлу в Volume
+  lastCode    String?   // последний полученный код входа (кэш)
+  lastCodeAt  DateTime? // когда получен код
+
+  @@index([productId, status])
+}
+
+model Customer {
+  id           String      @id @default(cuid())
+  tgId         String?     @unique
+  email        String?
+  username     String?
+  firstName    String?
+  lastName     String?
+  phone        String?
+  balance      Float       @default(0)
+  totalSpent   Float       @default(0)
+  ordersCount  Int         @default(0)
+  banned       Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  orders       Order[]
+  reviews      Review[]
+
+  @@index([tgId])
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  number      String      @unique
+  customerId  String?
+  customer    Customer?   @relation(fields: [customerId], references: [id])
+  customerTg  String?
+  customerName String?
+  status      String      @default("pending") // pending | paid | completed | cancelled | refunded
+  total       Float
+  currency    String      @default("RUB")
+  payMethod   String?     // card | stars | crypto | balance
+  note        String?
+  items       OrderItem[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  title     String
+  price     Float
+  qty       Int      @default(1)
+  delivered String? // delivered stock content for this item
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model Review {
+  id        String    @id @default(cuid())
+  productId String?
+  product   Product?  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  customerId String?
+  customer  Customer? @relation(fields: [customerId], references: [id])
+  author    String
+  tgId      String?
+  rating    Int       // 1..5
+  text      String
+  published Boolean   @default(true)
+  createdAt DateTime  @default(now())
+
+  @@index([productId, published])
+}
+
+model Settings {
+  id        String   @id @default("singleton")
+  storeName String   @default("Stars Market")
+  tagline   String   @default("Аккаунты и Telegram Stars мгновенно")
+  logo      String?
+  botUsername String?
+  miniAppUrl  String?
+  supportContact String?
+  currency  String   @default("RUB")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
