@@ -48,7 +48,7 @@ git push -u origin main
 | Variable | Value | Откуда взять |
 |----------|-------|--------------|
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` | Railway подставит автоматически (reference на PostgreSQL plugin) |
-| `BOT_TOKEN` | `***REDACTED_BOT_TOKEN***` | ваш токен |
+| `BOT_TOKEN` | `<YOUR_BOT_TOKEN>` | ваш токен |
 | `NEXTAUTH_SECRET` | любой случайный (32 символа) | `openssl rand -hex 32` |
 
 ### Шаг 4. Развернуть бота (Service 2)
@@ -67,7 +67,7 @@ git push -u origin main
 | Variable | Value |
 |----------|-------|
 | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` (тот же, что у админки) |
-| `BOT_TOKEN` | `***REDACTED_BOT_TOKEN***` |
+| `BOT_TOKEN` | `<YOUR_BOT_TOKEN>` |
 | `WEBAPP_URL` | `https://ВАШ-АДМИН-ДОМЕН.up.railway.app/?app=1#app` |
 
 > URL админки Railway выдаст после первого деплоя (вкладка **Settings → Networking → Generate Domain**).

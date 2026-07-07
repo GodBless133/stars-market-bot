@@ -31,8 +31,8 @@ export function AdminCustomers() {
   const load = () => {
     setLoading(true)
     api
-      .get<{ customers: Customer[] }>("/api/admin/customers")
-      .then((d) => setCustomers(d.customers))
+      .get<{ data: Customer[]; page: number; limit: number; total: number }>("/api/admin/customers?limit=200")
+      .then((d) => setCustomers(d.data || []))
       .finally(() => setLoading(false))
   }
 

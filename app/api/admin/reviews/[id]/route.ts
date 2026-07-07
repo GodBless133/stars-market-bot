@@ -16,15 +16,17 @@ export async function PATCH(
 
   const review = await db.review.update({ where: { id }, data })
 
-  // recompute rating
-  const agg = await db.review.aggregate({
-    where: { productId: review.productId, published: true },
-    _avg: { rating: true },
-  })
-  await db.product.update({
-    where: { id: review.productId },
-    data: { rating: agg._avg.rating ?? 0 },
-  })
+  // FIX 8: only recompute rating if productId is set
+  if (review.productId) {
+    const agg = await db.review.aggregate({
+      where: { productId: review.productId, published: true },
+      _avg: { rating: true },
+    })
+    await db.product.update({
+      where: { id: review.productId },
+      data: { rating: agg._avg.rating ?? 0 },
+    })
+  }
 
   return NextResponse.json({ review })
 }
@@ -35,13 +37,17 @@ export async function DELETE(
 ) {
   const { id } = await params
   const review = await db.review.delete({ where: { id } })
-  const agg = await db.review.aggregate({
-    where: { productId: review.productId, published: true },
-    _avg: { rating: true },
-  })
-  await db.product.update({
-    where: { id: review.productId },
-    data: { rating: agg._avg.rating ?? 0 },
-  })
+
+  // FIX 8: only recompute rating if productId is set
+  if (review.productId) {
+    const agg = await db.review.aggregate({
+      where: { productId: review.productId, published: true },
+      _avg: { rating: true },
+    })
+    await db.product.update({
+      where: { id: review.productId },
+      data: { rating: agg._avg.rating ?? 0 },
+    })
+  }
   return NextResponse.json({ ok: true })
 }

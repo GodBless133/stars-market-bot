@@ -56,12 +56,12 @@ cd ~/stars-market
 # Основной .env (для админки — нужен BOT_TOKEN для создания Stars-инвойсов)
 cat > .env << 'EOF'
 DATABASE_URL=file:/home/z/my-project/db/custom.db
-BOT_TOKEN=***REDACTED_BOT_TOKEN***
+BOT_TOKEN=<YOUR_BOT_TOKEN>
 EOF
 
 # .env бота
 cat > mini-services/tg-bot/.env << 'EOF'
-BOT_TOKEN=***REDACTED_BOT_TOKEN***
+BOT_TOKEN=<YOUR_BOT_TOKEN>
 WEBAPP_URL=https://ВАШ-ДОМЕН/?app=1#app
 DATABASE_URL="file:/home/user/stars-market/db/custom.db"
 EOF

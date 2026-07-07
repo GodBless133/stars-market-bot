@@ -8,7 +8,10 @@
     "start": "next start -p ${PORT:-3000} --hostname 0.0.0.0",
     "lint": "eslint .",
     "db:push": "prisma db push",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "db:seed": "tsx prisma/seed.ts && tsx prisma/seed-additional.ts",
+    "db:migrate": "prisma migrate deploy",
+    "db:studio": "prisma studio"
   },
   "dependencies": {
     "@prisma/client": "^6.11.1",

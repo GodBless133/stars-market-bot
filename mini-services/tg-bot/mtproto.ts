@@ -2,6 +2,9 @@
 // Python-сервис стабильно работает с Telethon, не блокирует бот
 
 const MTPROTO_API_URL = process.env.MTPROTO_API_URL || "http://localhost:8080";
+// Shared secret sent as X-MTPROTO-KEY header — must match MTPROTO_API_KEY on the
+// mtproto-api service. If unset here, the service will refuse /getcode (fail-closed).
+const MTPROTO_API_KEY = process.env.MTPROTO_API_KEY || "";
 
 /**
  * Получить код входа через Python MTProto сервис
@@ -14,7 +17,10 @@ export async function getLoginCode(
   try {
     const res = await fetch(`${MTPROTO_API_URL}/getcode`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(MTPROTO_API_KEY ? { "X-MTPROTO-KEY": MTPROTO_API_KEY } : {}),
+      },
       body: JSON.stringify({
         session: sessionData,
         phone: cacheKey,

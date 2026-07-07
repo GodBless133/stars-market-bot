@@ -24,7 +24,7 @@ interface TgProduct {
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}))
   const { items, customerTg, customerName } = body as {
-    items: { productId: string; qty: number }[]
+    items: { productId: string; qty: number; title?: string }[]
     customerTg?: string
     customerName?: string
   }
@@ -40,25 +40,38 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Корзина пуста" }, { status: 400 })
   }
 
+  // FIX 3a: validate each item qty
+  for (const it of items) {
+    if (
+      typeof it.qty !== "number" ||
+      !Number.isInteger(it.qty) ||
+      it.qty <= 0 ||
+      it.qty > 100
+    ) {
+      return NextResponse.json(
+        { error: "Некорректное количество товара (1..100)" },
+        { status: 400 }
+      )
+    }
+  }
+
+  // FIX 3b: dedupe items by productId (sum quantities)
+  const dedup = new Map<string, number>()
+  for (const it of items) {
+    dedup.set(it.productId, (dedup.get(it.productId) || 0) + it.qty)
+  }
+  const dedupedItems = Array.from(dedup.entries()).map(([productId, qty]) => ({
+    productId,
+    qty,
+  }))
+
   // Fetch products
-  const productIds = items.map((i) => i.productId)
+  const productIds = dedupedItems.map((i) => i.productId)
   const products = await db.product.findMany({
     where: { id: { in: productIds }, active: true },
   })
   if (products.length !== productIds.length) {
     return NextResponse.json({ error: "Некоторые товары недоступны" }, { status: 400 })
-  }
-
-  // Check stock (skip services)
-  for (const it of items) {
-    const p = products.find((x) => x.id === it.productId)!
-    if (p.type === "service") continue
-    const available = await db.stockItem.count({
-      where: { productId: p.id, status: "available" },
-    })
-    if (available < it.qty) {
-      return NextResponse.json({ error: `Недостаточно товара: ${p.title}` }, { status: 400 })
-    }
   }
 
   // Resolve customer
@@ -71,57 +84,77 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  const totalRub = items.reduce((s, it) => {
+  const totalRub = dedupedItems.reduce((s, it) => {
     const p = products.find((x) => x.id === it.productId)!
     return s + p.price * it.qty
   }, 0)
   const totalStars = rubToStars(totalRub)
 
-  // Create pending order
-  const order = await db.order.create({
-    data: {
-      number: genOrderNumber(),
-      customerId: customer?.id,
-      customerTg: customerTg || null,
-      customerName: customerName || null,
-      status: "pending",
-      total: totalRub,
-      payMethod: "stars",
-      items: {
-        create: items.map((it) => {
-          const p = products.find((x) => x.id === it.productId)!
-          return { productId: p.id, title: p.title, price: p.price, qty: it.qty }
-        }),
-      },
-    },
-    include: { items: true },
-  })
-
-  // Reserve stock (skip services, mark service items "в работе")
-  for (const it of order.items) {
-    const p = products.find((x) => x.id === it.productId)!
-    if (p.type === "service") {
-      await db.orderItem.update({
-        where: { id: it.id },
-        data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
+  // FIX 3c: atomic order creation + stock reservation
+  let order: { id: string; number: string; items: { id: string; productId: string; title: string; qty: number }[] }
+  try {
+    order = await db.$transaction(async (tx) => {
+      const created = await tx.order.create({
+        data: {
+          number: genOrderNumber(),
+          customerId: customer?.id,
+          customerTg: customerTg || null,
+          customerName: customerName || null,
+          status: "pending",
+          total: totalRub,
+          payMethod: "stars",
+          items: {
+            create: dedupedItems.map((it) => {
+              const p = products.find((x) => x.id === it.productId)!
+              return { productId: p.id, title: p.title, price: p.price, qty: it.qty }
+            }),
+          },
+        },
+        include: { items: true },
       })
-      continue
-    }
-    const reserved = await db.stockItem.findMany({
-      where: { productId: it.productId, status: "available" },
-      take: it.qty,
+
+      // Reserve stock (skip services, mark service items "в работе")
+      for (const it of created.items) {
+        const p = products.find((x) => x.id === it.productId)!
+        if (p.type === "service") {
+          await tx.orderItem.update({
+            where: { id: it.id },
+            data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
+          })
+          continue
+        }
+
+        const available = await tx.stockItem.findMany({
+          where: { productId: it.productId, status: "available" },
+          take: it.qty,
+          select: { id: true },
+        })
+        if (available.length < it.qty) {
+          throw new Error(`Недостаточно товара: ${it.title}`)
+        }
+        const reserved = await tx.stockItem.updateMany({
+          where: { id: { in: available.map((s) => s.id) } },
+          data: { status: "reserved", reservedOrderId: created.id },
+        })
+        if (reserved.count !== it.qty) {
+          throw new Error(`Race condition: не удалось зарезервировать ${it.title}`)
+        }
+      }
+
+      return created
     })
-    await db.stockItem.updateMany({
-      where: { id: { in: reserved.map((r) => r.id) } },
-      data: { status: "reserved" },
-    })
+  } catch (e: any) {
+    return NextResponse.json(
+      { error: e?.message || "Не удалось создать заказ" },
+      { status: 400 }
+    )
   }
 
   // Build label
   const label =
-    items.length === 1
+    dedupedItems.length === 1
       ? products[0].title
-      : `Заказ ${order.number} (${items.length} тов.)`
+      : `Заказ ${order.number} (${dedupedItems.length} тов.)`
 
   // Call Telegram Bot API: createInvoiceLink with XTR currency (Stars)
   const tgRes = await fetch(
@@ -141,20 +174,14 @@ export async function POST(req: NextRequest) {
   )
   const tgData = await tgRes.json()
   if (!tgData.ok) {
-    // Rollback: cancel the order + release stock
-    await db.order.update({ where: { id: order.id }, data: { status: "cancelled" } })
-    for (const it of order.items) {
-      const p = products.find((x) => x.id === it.productId)!
-      if (p.type === "service") continue
-      const stock = await db.stockItem.findMany({
-        where: { productId: it.productId, status: "reserved" },
-        take: it.qty,
+    // FIX 4: scoped rollback — release stock for this order, cancel order
+    await db.$transaction(async (tx) => {
+      await tx.stockItem.updateMany({
+        where: { reservedOrderId: order.id },
+        data: { status: "available", reservedOrderId: null },
       })
-      await db.stockItem.updateMany({
-        where: { id: { in: stock.map((s) => s.id) } },
-        data: { status: "available" },
-      })
-    }
+      await tx.order.update({ where: { id: order.id }, data: { status: "cancelled" } })
+    })
     return NextResponse.json(
       { error: `Telegram API: ${tgData.description || "ошибка создания инвойса"}` },
       { status: 500 }

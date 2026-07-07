@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server"
 import { db } from "@/lib/db"
+import { randomUUID } from "crypto"
 
 export const dynamic = "force-dynamic"
+
+const VALID_TYPES = ["digital", "stars", "account", "service"] as const
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
@@ -33,60 +36,100 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const body = await req.json().catch(() => ({}))
-  const {
-    title,
-    description,
-    longDesc,
-    price,
-    oldPrice,
-    categoryId,
-    type,
-    badge,
-    image,
-    featured,
-    active,
-    stockCount,
-  } = body as any
-
-  if (!title || !description || price == null || !categoryId) {
-    return NextResponse.json({ error: "Заполните обязательные поля" }, { status: 400 })
-  }
-
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9а-я]+/gi, "-")
-    .replace(/^-+|-+$/g, "") + "-" + Math.random().toString(36).slice(2, 6)
-
-  const product = await db.product.create({
-    data: {
+  try {
+    const body = await req.json().catch(() => ({}))
+    const {
       title,
-      slug,
       description,
       longDesc,
-      price: Number(price),
-      oldPrice: oldPrice ? Number(oldPrice) : null,
+      price,
+      oldPrice,
       categoryId,
-      type: type || "digital",
+      type,
       badge,
       image,
-      featured: !!featured,
-      active: active !== false,
-      currency: "RUB",
-    },
-  })
+      featured,
+      active,
+      stockCount,
+    } = body as any
 
-  // Create stock items
-  const count = Number(stockCount) || 0
-  for (let i = 0; i < count; i++) {
-    await db.stockItem.create({
+    if (!title || !description || price == null || !categoryId) {
+      return NextResponse.json({ error: "Заполните обязательные поля" }, { status: 400 })
+    }
+
+    // FIX 9: validate type
+    const productType = type || "digital"
+    if (!VALID_TYPES.includes(productType)) {
+      return NextResponse.json(
+        { error: `type должен быть одним из: ${VALID_TYPES.join(", ")}` },
+        { status: 400 }
+      )
+    }
+
+    // FIX 9: validate price is a non-negative number
+    const numPrice = Number(price)
+    if (!Number.isFinite(numPrice) || numPrice < 0) {
+      return NextResponse.json(
+        { error: "price должен быть неотрицательным числом" },
+        { status: 400 }
+      )
+    }
+
+    // FIX 9: validate categoryId exists
+    const category = await db.category.findUnique({ where: { id: categoryId } })
+    if (!category) {
+      return NextResponse.json(
+        { error: "Категория не найдена" },
+        { status: 400 }
+      )
+    }
+
+    // FIX 9: longer slug entropy
+    const slug =
+      title
+        .toLowerCase()
+        .replace(/[^a-z0-9а-я]+/gi, "-")
+        .replace(/^-+|-+$/g, "") +
+      "-" +
+      randomUUID().slice(0, 8)
+
+    const product = await db.product.create({
       data: {
-        productId: product.id,
-        content: `STOCK-${slug.toUpperCase()}-${Math.random().toString(36).slice(2, 12).toUpperCase()}`,
-        status: "available",
+        title,
+        slug,
+        description,
+        longDesc,
+        price: numPrice,
+        oldPrice: oldPrice ? Number(oldPrice) : null,
+        categoryId,
+        type: productType,
+        badge,
+        image,
+        featured: !!featured,
+        active: active !== false,
+        currency: "RUB",
       },
     })
-  }
 
-  return NextResponse.json({ product })
+    // Create stock items
+    const count = Number(stockCount) || 0
+    for (let i = 0; i < count; i++) {
+      await db.stockItem.create({
+        data: {
+          productId: product.id,
+          content: `STOCK-${slug.toUpperCase()}-${randomUUID().slice(0, 10).toUpperCase()}`,
+          status: "available",
+        },
+      })
+    }
+
+    return NextResponse.json({ product })
+  } catch (e: any) {
+    console.error("[admin/products] POST failed:", e)
+    // Prisma FK / validation errors → 400
+    if (e?.code === "P2002" || e?.code === "P2003" || e?.code === "P2014") {
+      return NextResponse.json({ error: e.message || "validation error" }, { status: 400 })
+    }
+    return NextResponse.json({ error: "internal error" }, { status: 500 })
+  }
 }

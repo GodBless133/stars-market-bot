@@ -1,44 +1,65 @@
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
 import { db } from "@/lib/db"
 export const dynamic = "force-dynamic"
 
+// Diagnostic / maintenance endpoint.
+// Now behind admin middleware (cookie-gated).
+// GET: minimal health-check — does NOT dump session content or PII.
 export async function GET() {
-  // Получить первый аккаунт с сессией для теста
-  const account = await db.stockItem.findFirst({
-    where: { productId: "cmqyh5jkc000fqk0pt8szw2kb", status: "available", sessionFile: { not: null } },
-    select: { id: true, phone: true, sessionFile: true },
-  })
-  
-  if (!account || !account.sessionFile) {
-    return NextResponse.json({ error: "No account with session" })
-  }
-  
-  // Тестируем Python MTProto напрямую
   try {
-    const res = await fetch("https://mtproto-api-production.up.railway.app/getcode", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session: account.sessionFile,
-        phone: account.phone,
-      }),
+    const reservedCount = await db.stockItem.count({
+      where: { status: "reserved" },
     })
-    const data = await res.json()
+    const availableCount = await db.stockItem.count({
+      where: { status: "available" },
+    })
+    const soldCount = await db.stockItem.count({
+      where: { status: "sold" },
+    })
     return NextResponse.json({
-      account: { id: account.id, phone: account.phone, sessionLen: account.sessionFile.length },
-      mtprotoResponse: data,
+      ok: true,
+      stock: { reserved: reservedCount, available: availableCount, sold: soldCount },
     })
   } catch (e: any) {
-    return NextResponse.json({ error: e.message })
+    return NextResponse.json({ error: "internal error" }, { status: 500 })
   }
 }
 
-export async function POST() {
-  // Сбросить все проданные аккаунты
-  const reset = await db.stockItem.updateMany({
-    where: { productId: "cmqyh5jkc000fqk0pt8szw2kb", status: { in: ["sold", "reserved"] } },
-    data: { status: "available", soldAt: null },
-  })
-  const available = await db.stockItem.count({ where: { productId: "cmqyh5jkc000fqk0pt8szw2kb", status: "available" } })
-  return NextResponse.json({ ok: true, reset: reset.count, available })
+// POST: reset RESERVED stock for a given productId back to available.
+// Requires productId in body or query. NEVER touches sold items.
+export async function POST(req: NextRequest) {
+  try {
+    const url = new URL(req.url)
+    const queryProductId = url.searchParams.get("productId")
+    let body: any = {}
+    try {
+      body = await req.json()
+    } catch {
+      body = {}
+    }
+    const productId = (body?.productId || queryProductId || "").trim()
+
+    if (!productId) {
+      return NextResponse.json(
+        { error: "productId обязателен (в body или ?productId=...)" },
+        { status: 400 }
+      )
+    }
+
+    // Only reset RESERVED — never sold items.
+    const reset = await db.stockItem.updateMany({
+      where: { productId, status: "reserved" },
+      data: { status: "available", reservedOrderId: null },
+    })
+    const available = await db.stockItem.count({
+      where: { productId, status: "available" },
+    })
+    return NextResponse.json({ ok: true, reset: reset.count, available })
+  } catch (e: any) {
+    console.error("[admin/reset-and-test] POST failed:", e)
+    return NextResponse.json(
+      { error: "internal error" },
+      { status: 500 }
+    )
+  }
 }

@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
+# Root deploy script — always runs the bot from mini-services/tg-bot/.
+# (Root index.ts was a stale duplicate and has been deleted.)
 BOT_DIR="mini-services/tg-bot"
 
-if [ -f "index.ts" ]; then
-  BOT_DIR="."
-elif [ -f "$BOT_DIR/index.ts" ]; then
-  BOT_DIR="$BOT_DIR"
-else
-  echo "❌ ERROR: index.ts не найден ни в корне, ни в $BOT_DIR/"
+if [ ! -f "$BOT_DIR/index.ts" ]; then
+  echo "❌ ERROR: $BOT_DIR/index.ts не найден."
   echo "Текущая папка: $(pwd)"
   ls -la
   exit 1
@@ -22,33 +20,26 @@ DB_URL="${DATABASE_URL:-}"
 echo "=== Stars Market Bot — startup ==="
 echo "DATABASE_URL scheme: $(echo "$DB_URL" | sed -E 's|^([a-z]+)://.*|\1|')"
 
-if echo "$DB_URL" | grep -q "^postgres"; then
-  PROVIDER="postgresql"
-elif echo "$DB_URL" | grep -q "^file:"; then
-  PROVIDER="sqlite"
-else
-  PROVIDER="postgresql"
-fi
+# NOTE: We no longer sed-rewrite the provider in schema.prisma at runtime.
+# The schema's declared provider (postgresql) must match DATABASE_URL at deploy time.
+# If you need sqlite locally, edit prisma/schema.prisma directly or maintain a
+# second schema file.
 
-echo "Using Prisma provider: $PROVIDER"
-
-sed -i "s|provider = \"sqlite\"|provider = \"$PROVIDER\"|g" prisma/schema.prisma
-sed -i "s|provider = \"postgresql\"|provider = \"$PROVIDER\"|g" prisma/schema.prisma
-
-# Убеждаемся что зависимости установлены
+# Install dependencies. No double-install fallback — fail if install fails.
 if [ ! -d "node_modules" ] || [ ! -d "node_modules/grammy" ]; then
   echo "→ installing bot dependencies (npm install)..."
-  npm install --omit=dev 2>&1 | tail -5 || npm install 2>&1 | tail -5
+  npm install --omit=dev
 fi
 
 echo "→ prisma generate"
 npx prisma generate
 
 echo "→ prisma db push (creating tables if needed)"
-npx prisma db push --skip-generate --accept-data-loss 2>&1 || {
+# --accept-data-loss removed — db push is safe by default.
+npx prisma db push --skip-generate 2>&1 || {
   echo "⚠️ db push failed — retrying in 5s..."
   sleep 5
-  npx prisma db push --skip-generate --accept-data-loss 2>&1 || echo "⚠️ retry failed"
+  npx prisma db push --skip-generate 2>&1 || echo "⚠️ retry failed"
 }
 
 echo "→ starting bot"
@@ -58,6 +49,6 @@ elif command -v tsx &> /dev/null; then
   exec tsx index.ts
 else
   echo "→ installing tsx (TypeScript runner for Node.js)..."
-  npm install --save tsx 2>&1 | tail -3
+  npm install --save tsx
   exec npx tsx index.ts
 fi

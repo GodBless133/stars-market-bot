@@ -3,6 +3,16 @@ import { db } from "@/lib/db"
 
 export const dynamic = "force-dynamic"
 
+// FIX 11: in-memory IP rate limiter — 1 review per 60s per IP
+const RATE_LIMIT_MS = 60 * 1000
+const ipLastPost = new Map<string, number>()
+
+function getClientIp(req: NextRequest): string {
+  const xff = req.headers.get("x-forwarded-for")
+  if (xff) return xff.split(",")[0]!.trim()
+  return req.headers.get("x-real-ip") || "unknown"
+}
+
 // Create review (public — без авторизации)
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}))
@@ -21,24 +31,20 @@ export async function POST(req: NextRequest) {
   if (!text || text.trim().length < 10) {
     return NextResponse.json({ error: "Текст отзыва минимум 10 символов" }, { status: 400 })
   }
-  if (!rating || rating < 1 || rating > 5) {
-    return NextResponse.json({ error: "Оценка от 1 до 5" }, { status: 400 })
+  // FIX 11: require integer rating 1..5
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return NextResponse.json({ error: "Оценка от 1 до 5 (целое число)" }, { status: 400 })
   }
 
-  // Антиспам: не больше 1 отзыва в минуту с одного tgId/IP (простая защита)
-  if (tgId) {
-    const recent = await db.review.findFirst({
-      where: {
-        tgId,
-        createdAt: { gte: new Date(Date.now() - 60 * 1000) },
-      },
-    })
-    if (recent) {
-      return NextResponse.json(
-        { error: "Подождите минуту перед следующим отзывом" },
-        { status: 429 }
-      )
-    }
+  // FIX 11: rate-limit by IP regardless of tgId presence
+  const ip = getClientIp(req)
+  const now = Date.now()
+  const last = ipLastPost.get(ip) || 0
+  if (now - last < RATE_LIMIT_MS) {
+    return NextResponse.json(
+      { error: "Подождите минуту перед следующим отзывом" },
+      { status: 429 }
+    )
   }
 
   // Проверяем product если указан
@@ -70,6 +76,9 @@ export async function POST(req: NextRequest) {
       published: true,
     },
   })
+
+  // Record successful post for rate-limiting
+  ipLastPost.set(ip, now)
 
   // Обновляем рейтинг товара
   if (productId) {

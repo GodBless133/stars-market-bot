@@ -78,7 +78,7 @@ bun run dev                              # бот на :3004
 | Variable | Где нужно | Значение |
 |----------|-----------|----------|
 | `DATABASE_URL` | админка + бот | путь к БД (SQLite или PostgreSQL) |
-| `BOT_TOKEN` | админка + бот | `***REDACTED_BOT_TOKEN***` |
+| `BOT_TOKEN` | админка + бот | `<YOUR_BOT_TOKEN>` (получите у [@BotFather](https://t.me/BotFather)) |
 | `WEBAPP_URL` | бот | URL Mini App (`https://домен/?app=1#app`) |
 
 ## 📂 Три варианта бота

@@ -11,7 +11,16 @@ async function request<T = any>(
     },
   })
   const text = await res.text()
-  const data = text ? JSON.parse(text) : null
+  let data: any = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      // FIX 14: surface the raw text on parse failure instead of throwing a
+      // confusing "Unexpected token" SyntaxError.
+      throw new Error("HTTP " + res.status + ": " + text.slice(0, 200))
+    }
+  }
   if (!res.ok) {
     const msg = data?.error || `Ошибка ${res.status}`
     throw new Error(msg)

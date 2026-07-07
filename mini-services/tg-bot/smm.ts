@@ -2,7 +2,8 @@
 // Документация: https://twiboost.com/api/v2
 
 const SMM_API_URL = "https://twiboost.com/api/v2";
-const SMM_API_KEY = process.env.SMM_API_KEY || "***REDACTED_SMM_KEY***";
+const SMM_API_KEY = process.env.SMM_API_KEY || "";
+if (!SMM_API_KEY) console.warn("[SMM] WARNING: SMM_API_KEY env var not set — SMM ordering will fail");
 
 // Маппинг услуг: тип → service ID на twiboost
 export const SMM_SERVICES: Record<string, { serviceId: string; name: string; pricePer1000: number; min: number; max: number }> = {
@@ -28,14 +29,18 @@ export const SMM_SERVICES: Record<string, { serviceId: string; name: string; pri
  * Проверить баланс SMM-сервиса
  */
 export async function getBalance(): Promise<{ balance: number; currency: string } | { error: string }> {
+  if (!SMM_API_KEY) return { error: "SMM_API_KEY not configured" };
   try {
     const url = `${SMM_API_URL}?key=${SMM_API_KEY}&action=balance`;
-    console.log("[SMM] getBalance URL:", url.substring(0, 60) + "...");
+    // Do NOT log the URL — it contains the API key.
+    console.log("[SMM] getBalance request (key redacted)");
     const res = await fetch(url);
     const data = await res.json();
     console.log("[SMM] getBalance response:", JSON.stringify(data));
     if (data.error) return { error: data.error };
-    return { balance: parseFloat(data.balance), currency: data.currency };
+    const bal = parseFloat(data.balance);
+    if (!Number.isFinite(bal)) return { error: "Invalid balance response" };
+    return { balance: bal, currency: data.currency };
   } catch (e: any) {
     console.error("[SMM] getBalance error:", e.message);
     return { error: e.message };
@@ -50,11 +55,12 @@ export async function createOrder(
   link: string,
   quantity: number
 ): Promise<{ orderId: number } | { error: string }> {
+  if (!SMM_API_KEY) return { error: "SMM_API_KEY not configured" };
   try {
     // Используем GET с query параметрами (как balance — это работает)
     const url = `${SMM_API_URL}?key=${SMM_API_KEY}&action=add&service=${serviceId}&link=${encodeURIComponent(link)}&quantity=${quantity}`;
-    console.log("[SMM] createOrder URL:", url.substring(0, 80) + "...");
-    console.log("[SMM] createOrder params:", { serviceId, link, quantity });
+    // Do NOT log the URL — it contains the API key.
+    console.log("[SMM] createOrder request (key redacted)", { serviceId, quantity });
     
     const res = await fetch(url);
     const text = await res.text();
@@ -93,11 +99,14 @@ export async function getOrderStatus(
     const res = await fetch(url);
     const data = await res.json();
     if (data.error) return { error: data.error };
+    const startCount = data.start_count ? parseInt(data.start_count) : undefined;
+    const remains = data.remains ? parseInt(data.remains) : undefined;
+    const charge = data.charge ? parseFloat(data.charge) : undefined;
     return {
       status: data.status,
-      startCount: data.start_count ? parseInt(data.start_count) : undefined,
-      remains: data.remains ? parseInt(data.remains) : undefined,
-      charge: data.charge ? parseFloat(data.charge) : undefined,
+      startCount: startCount !== undefined && Number.isFinite(startCount) ? startCount : undefined,
+      remains: remains !== undefined && Number.isFinite(remains) ? remains : undefined,
+      charge: charge !== undefined && Number.isFinite(charge) ? charge : undefined,
     };
   } catch (e: any) {
     return { error: e.message };

@@ -1,6 +1,9 @@
 // SMS Numbers модуль — интеграция с smsfast.vip (sms-activate совместимый API)
+// NOTE: this file is currently dead code (the bot uses the inline SMS helpers in index.ts),
+// but kept for consistency. Secrets come from env — no hardcoded defaults.
 const SMS_API = "https://backend.smsfast.vip/stubs/handler_api.php";
-const SMS_KEY = process.env.SMS_API_KEY || "***REDACTED_SMS_KEY***";
+const SMS_KEY = process.env.SMS_API_KEY || "";
+if (!SMS_KEY) console.warn("[sms-numbers] WARNING: SMS_API_KEY env var not set — functions will throw");
 
 // Маппинг стран: название → ID для smsfast.vip handler_api
 // ВАЖНО: ID разные для REST API и handler_api!
@@ -15,15 +18,19 @@ export const SMS_COUNTRIES: Record<string, { id: number; name: string }> = {
 };
 
 export async function getBalance(): Promise<number> {
+  if (!SMS_KEY) throw new Error("SMS_API_KEY not configured");
   const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=getBalance`);
   const text = await res.text();
   if (text.startsWith("ACCESS_BALANCE:")) {
-    return parseFloat(text.split(":")[1]);
+    const bal = parseFloat(text.split(":")[1]);
+    if (!Number.isFinite(bal)) throw new Error("Invalid balance response: " + text);
+    return bal;
   }
   throw new Error(text);
 }
 
 export async function orderNumber(service: string, country: number): Promise<{ id: number; phone: string }> {
+  if (!SMS_KEY) throw new Error("SMS_API_KEY not configured");
   console.log("[SMS] orderNumber:", { service, country });
   const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=getNumber&service=${service}&country=${country}`);
   const text = await res.text();
@@ -31,7 +38,9 @@ export async function orderNumber(service: string, country: number): Promise<{ i
   
   if (text.startsWith("ACCESS_NUMBER:")) {
     const parts = text.split(":");
-    return { id: parseInt(parts[1]), phone: "+" + parts[2] };
+    const id = parseInt(parts[1]);
+    if (!Number.isFinite(id) || !parts[2]) throw new Error("Invalid number response: " + text);
+    return { id, phone: "+" + parts[2] };
   }
   if (text === "NO_NUMBERS") throw new Error("Нет доступных номеров для этой страны. Попробуйте другую.");
   if (text === "NO_BALANCE") throw new Error("Недостаточно средств на балансе сервиса.");

@@ -67,8 +67,10 @@ model StockItem {
   sessionFile String?   // путь к .session файлу в Volume
   lastCode    String?   // последний полученный код входа (кэш)
   lastCodeAt  DateTime? // когда получен код
+  reservedOrderId String?   // ID заказа, под который зарезервирован (для scoped release)
 
   @@index([productId, status])
+  @@index([reservedOrderId])
 }
 
 model Customer {

@@ -57,10 +57,11 @@ export function AdminOrders() {
     setLoading(true)
     const params = new URLSearchParams()
     if (status !== "all") params.set("status", status)
+    params.set("limit", "200")
     api
-      .get<{ orders: Order[] }>(`/api/admin/orders?${params}`)
+      .get<{ data: Order[]; page: number; limit: number; total: number }>(`/api/admin/orders?${params}`)
       .then((d) => {
-        let list = d.orders
+        let list = d.data || []
         if (search) {
           const q = search.toLowerCase()
           list = list.filter(

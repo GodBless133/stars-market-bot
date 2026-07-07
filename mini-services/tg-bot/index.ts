@@ -15,7 +15,8 @@ import {
 
 // === SMS NUMBERS (встроено напрямую, без отдельного файла) ===
 const SMS_API = "https://backend.smsfast.vip/stubs/handler_api.php";
-const SMS_KEY = "***REDACTED_SMS_KEY***";
+const SMS_KEY = process.env.SMS_API_KEY || "";
+if (!SMS_KEY) console.warn("[tg-bot] WARNING: SMS_API_KEY env var not set — SMS number ordering will fail");
 
 async function smsOrderNumber(service: string, country: number): Promise<{ id: number; phone: string }> {
   const url = `${SMS_API}?api_key=${SMS_KEY}&action=getNumber&service=${service}&country=${country}`;
@@ -25,7 +26,11 @@ async function smsOrderNumber(service: string, country: number): Promise<{ id: n
   console.log("[SMS] response:", text);
   if (text.startsWith("ACCESS_NUMBER:")) {
     const parts = text.split(":");
-    return { id: parseInt(parts[1]), phone: "+" + parts[2] };
+    const id = parseInt(parts[1]);
+    if (!Number.isFinite(id) || !parts[2]) {
+      throw new Error("Некорректный ответ сервиса номеров: " + text);
+    }
+    return { id, phone: "+" + parts[2] };
   }
   if (text === "NO_NUMBERS") throw new Error("Нет доступных номеров для этой страны. Попробуйте другую.");
   if (text === "NO_BALANCE") throw new Error("Недостаточно средств на сервисе номеров.");
@@ -74,9 +79,6 @@ const httpServer = createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       bot: botRunning ? "running" : "idle",
-      token: BOT_TOKEN ? "set" : "empty",
-      botObj: bot ? "created" : "null",
-      port: PORT,
     }));
     return;
   }
@@ -131,8 +133,18 @@ function stars(n: number): string {
   return "⭐".repeat(full) + (half ? "✨" : "");
 }
 
+// Escape Markdown special characters in user-supplied strings before interpolating
+// into a Markdown message. Prevents injection / broken formatting from product titles etc.
+function escapeMd(s: string): string {
+  return String(s ?? "").replace(/([_*`\[\]()~>#+\-=|{}.!\\])/g, "\\$1");
+}
+
 // ---------- Bot setup ----------
 async function setupBot() {
+  // Guard against double invocation — multiple setupBot() calls would create duplicate
+  // bot instances and start two long-polling loops against the same token.
+  if (bot) return;
+
   if (!BOT_TOKEN) {
     console.log(
       "BOT_TOKEN not set — bot in idle mode. HTTP health on :3004 still running."
@@ -143,7 +155,8 @@ async function setupBot() {
   bot = new Bot(BOT_TOKEN);
 
   bot.catch((err) => {
-    console.error("[tg-bot] Bot error:", err.error);
+    console.error("[bot] error:", err.error);
+    console.error("[bot] update:", JSON.stringify(err.ctx?.update ?? null).slice(0, 500));
   });
 
   // /start
@@ -328,7 +341,7 @@ async function setupBot() {
         `✅ *Аккаунт загружен!*\n\n` +
         `Товар: ${upload.productId}\n` +
         `Телефон: ${upload.phone}\n` +
-        `Session: ${sessionFileName}\n` +
+        `Session: ${fileName}\n` +
         `ID склада: ${stockItem.id}\n\n` +
         `Всего на складе: ${totalStock}\n\n` +
         `Используйте /uploadsession для ещё одного аккаунта.`,
@@ -525,12 +538,9 @@ async function setupBot() {
     await ctx.answerCallbackQuery();
   });
 
-  // Pay button — marks order paid + delivers
-  bot.callbackQuery(/^pay:(.+)$/, async (ctx) => {
-    const orderId = ctx.match[1];
-    await payOrder(ctx, orderId);
-    await ctx.answerCallbackQuery();
-  });
+  // NOTE: The "pay:" callback that bypassed payment has been REMOVED.
+  // Users must pay via the Stars invoice sent at order creation. If they lost it,
+  // they cancel and re-order.
 
   // Cancel order
   bot.callbackQuery(/^cancel_order:(.+)$/, async (ctx) => {
@@ -566,24 +576,31 @@ async function setupBot() {
     const orderId = ctx.match[1];
     const smsOrder = pendingSMSOrders.get(orderId);
     
-    if (smsOrder) {
-      // Отменяем старый номер
-      try { await smsSetStatus(smsOrder.activationId, 8); } catch {}
-      pendingSMSOrders.delete(orderId);
+    if (!smsOrder) {
+      // No active SMS order to change — likely already completed/cancelled.
+      await ctx.answerCallbackQuery({ text: "⚠️ Активный номер не найден. Заказ уже завершён или отменён." });
+      return;
     }
+    
+    // Capture country BEFORE deleting from the map (default to 115/США if missing).
+    const country = smsOrder.country ?? 115;
+    
+    // Отменяем старый номер
+    try { await smsSetStatus(smsOrder.activationId, 8); } catch {}
+    pendingSMSOrders.delete(orderId);
     
     await ctx.answerCallbackQuery({ text: "🔄 Заказываю новый номер..." });
     
     // Заказываем новый номер
     try {
-      const result = await smsOrderNumber("tg", countryToUse);
+      const result = await smsOrderNumber("tg", country);
       pendingSMSOrders.set(orderId, {
         activationId: result.id,
         phone: result.phone,
         attempts: 0,
         chatId: ctx.chat.id,
         tgId: String(ctx.from?.id),
-        country: countryToUse,
+        country: country,
       });
       
       // Обновляем заказ
@@ -754,6 +771,10 @@ async function setupBot() {
           data: { delivered: `🚀 Заказ запущен!\nSMM Order: #${result.orderId}\nУслуга: ${req.productTitle}\nКоличество: ${req.quantity}\nСсылка: ${link}\nСтатус: In progress` },
         });
         
+        // SMM order was created successfully — now (and only now) mark the order as completed.
+        // (Earlier the order was set to "paid" while waiting for the buyer's link.)
+        await db.order.update({ where: { id: req.orderId }, data: { status: "completed" } });
+        
         await ctx.reply(
           `✅ *Заказ на накрутку запущен!*\n\n` +
           `📋 Номер заказа: *${req.orderId.slice(-8).toUpperCase()}*\n` +
@@ -772,7 +793,7 @@ async function setupBot() {
           try {
             await ctx.api.sendMessage(adminId,
               `🔔 *Новый заказ на накрутку*\n\n` +
-              `👤 Клиент: ${ctx.from?.first_name || "Unknown"} (${tgId})\n` +
+              `👤 Клиент: ${ctx.from?.first_name || "Unknown"} (${userId})\n` +
               `📋 Заказ: ${req.orderId.slice(-8).toUpperCase()}\n` +
               `🔢 SMM: #${result.orderId}\n` +
               `📦 Услуга: ${req.productTitle}\n` +
@@ -860,12 +881,16 @@ async function setupBot() {
         body: JSON.stringify({ pre_checkout_query_id: preCheckoutId, ok, error }),
       });
     } catch (e: any) {
-      console.error("[tg-bot] pre_checkout error:", e);
-      // Всё равно отвечаем ok=true чтобы не блокировать
+      console.error("[pre_checkout] error:", e);
+      // Fail-closed: do NOT confirm a charge we couldn't validate. Telegram will refund the user.
       await fetch(`https://api.telegram.org/bot${botToken}/answerPreCheckoutQuery`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pre_checkout_query_id: preCheckoutId, ok: true }),
+        body: JSON.stringify({
+          pre_checkout_query_id: preCheckoutId,
+          ok: false,
+          error_message: "Не удалось обработать заказ. Попробуйте позже или обратитесь в поддержку.",
+        }),
       });
     }
   });
@@ -906,7 +931,8 @@ async function setupBot() {
         let country = 115;
         const countryMatch = product.longDesc?.match(/Страна: ID (\d+)/);
         if (countryMatch) {
-          country = parseInt(countryMatch[1]);
+          const parsed = parseInt(countryMatch[1]);
+          if (Number.isFinite(parsed)) country = parsed;
         } else {
           if (product.title.includes("Индонез")) country = 6;
           else if (product.title.includes("Канад")) country = 34;
@@ -983,10 +1009,12 @@ async function setupBot() {
           
           await db.orderItem.updateMany({
             where: { orderId: order.id },
-            data: { delivered: "⏳ Ожидает ссылку на канал/пост от покупателя" },
+            data: { delivered: "⏳ Ожидает ссылку для накрутки..." },
           });
           
-          await db.order.update({ where: { id: order.id }, data: { status: "completed" } });
+          // Order is paid but NOT yet completed — completion happens only after
+          // the buyer sends a link AND smmCreateOrder succeeds (see link-handler above).
+          await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
           
           await ctx.reply(
             `🚀 *Заказ на накрутку оплачен!*\n\n` +
@@ -1021,9 +1049,11 @@ async function setupBot() {
     }
   });
 
-  // Автопроверка SMM-заказов каждые 5 минут (ВРЕМЕННО ОТКЛЮЧЕНО)
-  /* setInterval(async () => {
+  // Автопроверка SMM-заказов каждые 5 минут.
+  // Each getOrderStatus call is wrapped in try/catch so one failure doesn't kill the loop.
+  setInterval(async () => {
     try {
+      if (!bot) return;
       // Ищем заказы со SMM Order в delivered, которые ещё не завершены
       const orders = await db.order.findMany({
         where: {
@@ -1035,37 +1065,60 @@ async function setupBot() {
       for (const o of orders) {
         for (const it of o.items) {
           if (!it.delivered || !it.delivered.includes("SMM Order")) continue;
-          if (it.delivered.includes("Completed")) continue; // уже завершён
+          if (it.delivered.includes("✅ Накрутка выполнена")) continue; // уже завершён
+          if (it.delivered.includes("Накрутка отменена")) continue;
           
           const smmMatch = it.delivered.match(/SMM Order: #(\d+)/);
           if (!smmMatch) continue;
           const smmId = parseInt(smmMatch[1]);
+          if (!Number.isFinite(smmId)) continue;
           
-          const status = await getOrderStatus(smmId);
-          if ("error" in status) continue;
+          let status;
+          try {
+            status = await getOrderStatus(smmId);
+          } catch (e: any) {
+            console.error(`[smm-poll] getOrderStatus error for SMM #${smmId}:`, e.message);
+            continue;
+          }
+          if (!status || "error" in status) continue;
           
-          if (status.status === "Completed") {
-            // Обновляем запись
+          const s = status.status;
+          if (s === "Completed" || s === "Partial") {
+            const label = s === "Completed"
+              ? `✅ Накрутка выполнена (заказ #${smmId})`
+              : `⚠️ Накрутка выполнена частично (заказ #${smmId}, остаток: ${status.remains ?? 0})`;
             await db.orderItem.update({
               where: { id: it.id },
-              data: { delivered: it.delivered.replace("In progress", "Completed") },
+              data: { delivered: it.delivered.replace(/Статус: In progress/i, "Статус: " + s) + "\n" + label },
             });
-            // Уведомляем покупателя
             if (o.customerTg) {
               try {
                 await bot!.api.sendMessage(o.customerTg,
-                  `✅ *Накрутка завершена!*\n\nЗаказ ${o.number}\nSMM #${smmId}\nСтатус: Completed\n\nСпасибо за покупку! 🙏\nОставьте отзыв: /reviews`,
+                  `✅ *Накрутка выполнена!*\n\nЗаказ ${o.number}\nSMM #${smmId}\nСтатус: ${s}\n\nСпасибо за покупку! 🙏\nОставьте отзыв: /reviews`,
                   { parse_mode: "Markdown" }
                 );
-              } catch (e) { console.error("Notify customer error:", e); }
+              } catch (e) { console.error("[smm-poll] Notify customer error:", e); }
+            }
+          } else if (s === "Canceled" || s === "Cancelled") {
+            await db.orderItem.update({
+              where: { id: it.id },
+              data: { delivered: it.delivered.replace(/Статус: In progress/i, "Статус: Canceled") + "\n❌ Накрутка отменена (заказ #" + smmId + ")" },
+            });
+            if (o.customerTg) {
+              try {
+                await bot!.api.sendMessage(o.customerTg,
+                  `❌ *Накрутка отменена*\n\nЗаказ ${o.number}\nSMM #${smmId}\n\nОбратитесь в поддержку для возврата.`,
+                  { parse_mode: "Markdown" }
+                );
+              } catch (e) { console.error("[smm-poll] Notify customer error:", e); }
             }
           }
         }
       }
     } catch (e) {
-      console.error("[tg-bot] SMM autopoll error:", e);
+      console.error("[smm-poll] error:", e);
     }
-  }, 5 * 60 * 1000); // каждые 5 минут */
+  }, 5 * 60 * 1000); // каждые 5 минут
 
   botRunning = true;
 
@@ -1332,7 +1385,8 @@ async function showOrders(ctx: any) {
 
     const kb = new InlineKeyboard();
     if (o.status === "pending") {
-      kb.text("✅ Оплатил", `pay:${o.id}`).row();
+      // NOTE: the "✅ Оплатил" button was removed — it bypassed payment and delivered for free.
+      // Users pay via the Stars invoice sent at order creation. If they lost it, they cancel and re-order.
       kb.text("❌ Отменить", `cancel_order:${o.id}`);
     }
     await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
@@ -1496,14 +1550,40 @@ async function createOrderFromProduct(ctx: any, productId: string) {
       });
       continue;
     }
-    const reserved = await db.stockItem.findMany({
-      where: { productId, status: "available" },
-      take: it.qty,
-    });
-    await db.stockItem.updateMany({
-      where: { id: { in: reserved.map((r) => r.id) } },
-      data: { status: "reserved" },
-    });
+    // Atomic stock reservation. Pre-fetch available IDs, then run an updateMany that
+    // asserts status="available" so two concurrent buyers can't both grab the same row.
+    // If fewer than it.qty rows were updated (race), rollback and cancel the order.
+    try {
+      const available = await db.stockItem.findMany({
+        where: { productId, status: "available" },
+        take: it.qty,
+        select: { id: true },
+      });
+      const [updated] = await db.$transaction([
+        db.stockItem.updateMany({
+          where: { id: { in: available.map((r) => r.id) }, status: "available" },
+          data: { status: "reserved", reservedOrderId: order.id },
+        }),
+      ]);
+      if (updated.count < it.qty) {
+        // Race: another buyer grabbed some of these rows in the meantime.
+        // Release anything we did manage to reserve for this order, then bail.
+        await db.stockItem.updateMany({
+          where: { reservedOrderId: order.id },
+          data: { status: "available", reservedOrderId: null },
+        });
+        throw new Error("Недостаточно товара на складе");
+      }
+    } catch (e: any) {
+      // Reservation failed — cancel the freshly-created order so it doesn't dangle.
+      await db.order.update({ where: { id: order.id }, data: { status: "cancelled" } });
+      await db.stockItem.updateMany({
+        where: { reservedOrderId: order.id },
+        data: { status: "available", reservedOrderId: null },
+      });
+      await ctx.reply(`⚠️ ${e.message}\n\nЗаказ ${order.number} отменён.`, { reply_markup: mainMenuInline() });
+      return;
+    }
   }
 
   // Проверяем это виртуальный номер (slug содержит "nomer" или "number")
@@ -1552,34 +1632,7 @@ async function createOrderFromProduct(ctx: any, productId: string) {
   }
 }
 
-// ---------- Pay + deliver (manual fallback button) ----------
-async function payOrder(ctx: any, orderId: string) {
-  const order = await db.order.findUnique({
-    where: { id: orderId },
-    include: { items: true, customer: true },
-  });
-  if (!order) {
-    await ctx.reply("Заказ не найден.");
-    return;
-  }
-  if (order.status === "completed") {
-    await ctx.reply("Этот заказ уже оплачен и доставлен ✅");
-    return;
-  }
-  if (order.status === "cancelled") {
-    await ctx.reply("Этот заказ отменён.");
-    return;
-  }
-
-  await deliverOrder(order);
-  const fresh = await db.order.findUnique({
-    where: { id: orderId },
-    include: { items: true },
-  });
-  await sendDeliveryMessage(ctx, fresh!);
-}
-
-// ---------- Delivery core (used by manual pay + successful_payment) ----------
+// ---------- Delivery core (used by successful_payment) ----------
 async function deliverOrder(order: any) {
   const deliveredLines: string[] = [];
   for (const it of order.items) {
@@ -1592,45 +1645,64 @@ async function deliverOrder(order: any) {
           data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
         });
       }
-      deliveredLines.push(`*${it.title}*:\n🚀 Заказ принят в работу. Старт в течение 1 часа.`);
+      deliveredLines.push(`*${escapeMd(it.title)}*:\n🚀 Заказ принят в работу. Старт в течение 1 часа.`);
       await db.product.update({
         where: { id: it.productId },
         data: { salesCount: { increment: it.qty } },
       });
       continue;
     }
+    // Fetch reserved stock SCOPED to THIS order via reservedOrderId (not by productId/status,
+    // which could grab another order's reserved items).
     let stock = await db.stockItem.findMany({
-      where: { productId: it.productId, status: "reserved" },
+      where: { reservedOrderId: order.id, status: "reserved" },
       take: it.qty,
     });
     if (stock.length < it.qty) {
-      const more = await db.stockItem.findMany({
-        where: { productId: it.productId, status: "available" },
-        take: it.qty - stock.length,
-      });
-      stock = [...stock, ...more];
+      // Under-delivery: less stock reserved than ordered. Don't silently deliver empty.
+      // Log a warning and set a marker; the order will stay "paid" for admin follow-up below.
+      console.warn(`[deliverOrder] under-delivery for order ${order.id}, item ${it.id}: needed ${it.qty}, got ${stock.length}`);
     }
     if (stock.length > 0) {
       await db.stockItem.updateMany({
         where: { id: { in: stock.map((s) => s.id) } },
-        data: { status: "sold", soldAt: new Date() },
+        data: { status: "sold", soldAt: new Date(), reservedOrderId: null },
       });
       const content = stock.map((s) => s.content).join("\n");
+      const tail = stock.length < it.qty
+        ? `\n\n⚠️ Недостаточно товара: доставлено ${stock.length} из ${it.qty}. Свяжитесь с поддержкой.`
+        : "";
       await db.orderItem.update({
         where: { id: it.id },
-        data: { delivered: content },
+        data: { delivered: content + tail },
       });
-      deliveredLines.push(`*${it.title}*:\n\`\`\`\n${content}\n\`\`\``);
+      deliveredLines.push(`*${escapeMd(it.title)}*:\n\`\`\`\n${content}\n\`\`\``);
+      // salesCount increments ONLY when stock was actually delivered (fixes double-count on empty delivery).
+      await db.product.update({
+        where: { id: it.productId },
+        data: { salesCount: { increment: stock.length } },
+      });
+    } else {
+      // Nothing to deliver at all — leave a marker so the customer knows to contact support.
+      await db.orderItem.update({
+        where: { id: it.id },
+        data: { delivered: "⚠️ Недостаточно товара на складе. Свяжитесь с поддержкой." },
+      });
+      deliveredLines.push(`*${escapeMd(it.title)}*:\n⚠️ Недостаточно товара на складе. Свяжитесь с поддержкой.`);
     }
-    await db.product.update({
-      where: { id: it.productId },
-      data: { salesCount: { increment: it.qty } },
-    });
   }
 
+  // Only mark the order "completed" if EVERY item was fully delivered.
+  // If any item under-delivered, leave it "paid" so an admin can follow up.
+  const freshOrder = await db.order.findUnique({ where: { id: order.id }, include: { items: true } });
+  const allDelivered = (freshOrder?.items ?? []).every((it) => {
+    if (!it.delivered) return false;
+    // Items with the under-delivery marker are not "fully delivered".
+    return !it.delivered.includes("⚠️ Недостаточно товара");
+  });
   await db.order.update({
     where: { id: order.id },
-    data: { status: "completed" },
+    data: { status: allDelivered ? "completed" : "paid" },
   });
 
   if (order.customer) {
@@ -1668,7 +1740,7 @@ async function sendDeliveryMessage(ctx: any, order: any) {
       codeButtons.push(it.id);
       
       lines.push(
-        `*${it.title}*\n\n` +
+        `*${escapeMd(it.title)}*\n\n` +
         `📱 Телефон: ${phone}\n` +
         `🔐 Пароль: ${password}\n` +
         `🔒 2FA: ${twoFA}\n\n` +
@@ -1680,7 +1752,7 @@ async function sendDeliveryMessage(ctx: any, order: any) {
       );
     } else {
       // Обычный товар
-      lines.push(`*${it.title}*:\n${it.delivered.startsWith("🚀") ? it.delivered : "```\n" + it.delivered + "\n```"}`);
+      lines.push(`*${escapeMd(it.title)}*:\n${it.delivered.startsWith("🚀") || it.delivered.startsWith("⚠️") ? it.delivered : "```\n" + it.delivered + "\n```"}`);
     }
   }
   
@@ -1720,17 +1792,12 @@ async function cancelOrder(ctx: any, orderId: string) {
     return;
   }
 
-  // Release reserved stock
-  for (const it of order.items) {
-    const stock = await db.stockItem.findMany({
-      where: { productId: it.productId, status: "reserved" },
-      take: it.qty,
-    });
-    await db.stockItem.updateMany({
-      where: { id: { in: stock.map((s) => s.id) } },
-      data: { status: "available" },
-    });
-  }
+  // Release reserved stock — SCOPED to this order via reservedOrderId so we never
+  // release another order's reserved items.
+  await db.stockItem.updateMany({
+    where: { reservedOrderId: order.id },
+    data: { status: "available", reservedOrderId: null },
+  });
 
   await db.order.update({
     where: { id: orderId },

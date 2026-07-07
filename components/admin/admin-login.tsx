@@ -7,18 +7,32 @@ import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ShieldCheck, Lock, ExternalLink } from "lucide-react"
 
-const ADMIN_PASSWORD = "Sm$2024!StarsMkt9xK"
-
 export function AdminLogin({ onBack }: { onBack: () => void }) {
   const setAdminAuthed = useStore((s) => s.setAdminAuthed)
   const [password, setPassword] = useState("")
   const [error, setError] = useState("")
+  const [loading, setLoading] = useState(false)
 
-  const submit = () => {
-    if (password === ADMIN_PASSWORD) {
-      setAdminAuthed(true)
-    } else {
-      setError("Неверный пароль")
+  const submit = async () => {
+    setError("")
+    setLoading(true)
+    try {
+      const res = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      })
+      if (res.status === 200) {
+        setAdminAuthed(true)
+      } else if (res.status === 401) {
+        setError("Неверный пароль")
+      } else {
+        setError("Ошибка входа. Попробуйте позже.")
+      }
+    } catch {
+      setError("Ошибка сети. Попробуйте позже.")
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -48,8 +62,8 @@ export function AdminLogin({ onBack }: { onBack: () => void }) {
             />
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
-          <Button className="w-full" onClick={submit}>
-            Войти
+          <Button className="w-full" onClick={submit} disabled={loading}>
+            {loading ? "Вход..." : "Войти"}
           </Button>
           <Button variant="ghost" className="w-full" onClick={onBack}>
             <ExternalLink className="h-4 w-4 mr-2" /> Открыть Mini App
