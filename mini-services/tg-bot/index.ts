@@ -915,16 +915,34 @@ async function setupBot() {
 
       const tgId = String(ctx.from?.id ?? "");
       const firstItem = order.items[0];
-      const product = await db.product.findUnique({ where: { id: firstItem.productId } });
+      if (!firstItem) {
+        console.error("[tg-bot] successful_payment: order has no items", order.id);
+        await ctx.reply("⚠️ Заказ не содержит товаров. Обратитесь в поддержку.");
+        return;
+      }
+      // Include category so we can detect product type robustly (slug keywords alone are fragile).
+      const product = await db.product.findUnique({
+        where: { id: firstItem.productId },
+        include: { category: true },
+      });
       
       if (!product) {
         await ctx.reply("⚠️ Товар не найден. Обратитесь в поддержку.");
         return;
       }
 
-      // Определяем тип товара
-      const isVirtualNumber = product.slug.includes("nomer") || product.slug.includes("number") || product.slug.includes("virtual");
-      const isBoost = product.type === "service" && (product.slug.includes("nakrutka") || product.slug.includes("подписчик") || product.slug.includes("просмотр") || product.slug.includes("реакц"));
+      // Определяем тип товара по категории + slug + названию (надёжнее чем только slug)
+      const catSlug = product.category?.slug ?? "";
+      const titleLower = product.title.toLowerCase();
+      const slugLower = product.slug.toLowerCase();
+      const isVirtualNumber =
+        catSlug === "virtual-numbers" ||
+        slugLower.includes("nomer") || slugLower.includes("number") || slugLower.includes("virtual") || slugLower.includes("sms") ||
+        titleLower.includes("виртуальн") || titleLower.includes("номер");
+      const isBoost =
+        product.type === "service" &&
+        (catSlug === "boost" || catSlug === "nakrutka" ||
+         slugLower.includes("nakrutka") || slugLower.includes("подписчик") || slugLower.includes("просмотр") || slugLower.includes("реакц"));
 
       if (isVirtualNumber) {
         // === ВИРТУАЛЬНЫЙ НОМЕР ===
@@ -936,9 +954,10 @@ async function setupBot() {
         } else {
           if (product.title.includes("Индонез")) country = 6;
           else if (product.title.includes("Канад")) country = 34;
-          else if (product.title.includes("США")) country = 115;
-          else if (product.title.includes("Великобритан")) country = 16;
+          else if (product.title.includes("США") || product.title.includes("USA")) country = 115;
+          else if (product.title.includes("Великобритан") || product.title.includes("UK")) country = 16;
           else if (product.title.includes("Португал")) country = 93;
+          //RU/UA не поддерживаются smsfast.vip для Telegram — fallback на США(115)
         }
         
         try {
@@ -1045,7 +1064,19 @@ async function setupBot() {
       await sendDeliveryMessage(ctx, fresh!);
     } catch (e: any) {
       console.error("[tg-bot] successful_payment error:", e);
-      await ctx.reply("⚠️ Ошибка при выдаче товара. Напишите в поддержку с номером заказа.");
+      // Показываем номер заказа и краткую ошибку — так поддержка сможет быстро помочь.
+      const orderNum = (() => { try { const p = JSON.parse(ctx.message?.successful_payment?.invoice_payload || "{}"); return p.orderId || ""; } catch { return ""; } })();
+      let orderNumber = "неизвестен";
+      if (orderNum) {
+        try { const o = await db.order.findUnique({ where: { id: orderNum }, select: { number: true } }); if (o) orderNumber = o.number; } catch {}
+      }
+      await ctx.reply(
+        `⚠️ Ошибка при выдаче товара.\n\n` +
+        `Заказ: *${orderNumber}*\n` +
+        `Причина: ${String(e?.message || e).slice(0, 200)}\n\n` +
+        `Напишите в поддержку с этим номером заказа.`,
+        { parse_mode: "Markdown" }
+      );
     }
   });
 
