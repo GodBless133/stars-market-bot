@@ -19,92 +19,116 @@ export async function PATCH(
 
   if (action === "pay" || action === "complete") {
     // Deliver: assign stock items to each order item.
-    // FIX 10: if stock is insufficient, do NOT mark completed; set delivered
-    // to a warning string and leave the order status as "paid".
+    // FIX 4: run the entire delivery inside an interactive transaction with
+    // a fresh fetch + re-check of `it.delivered` so concurrent "complete"
+    // requests cannot double-count salesCount / totalSpent / sell stock twice.
     let allDelivered = true
+    let updated: any = null
+    try {
+      const txResult = await db.$transaction(async (tx) => {
+        // Re-fetch inside the transaction for a consistent snapshot.
+        const freshOrder = await tx.order.findUnique({
+          where: { id },
+          include: { items: true, customer: true },
+        })
+        if (!freshOrder) throw new Error("order not found")
 
-    for (const it of order.items) {
-      // `it.delivered` may be a real delivery OR a "⚠️ Недостаточно товара"
-      // warning from a previous incomplete attempt. Only skip re-delivery for
-      // real deliveries (so the admin can retry after restocking).
-      if (it.delivered && !it.delivered.startsWith("⚠️")) {
-        // already delivered (e.g. service "в работе") — just bump sales
-        await db.product.update({
-          where: { id: it.productId },
-          data: { salesCount: { increment: it.qty } },
-        })
-        continue
-      }
-      const product = await db.product.findUnique({ where: { id: it.productId } })
-      if (product?.type === "service") {
-        await db.orderItem.update({
-          where: { id: it.id },
-          data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
-        })
-        await db.product.update({
-          where: { id: it.productId },
-          data: { salesCount: { increment: it.qty } },
-        })
-        continue
-      }
-      const stock = await db.stockItem.findMany({
-        where: { productId: it.productId, status: { in: ["reserved", "available"] } },
-        take: it.qty,
-      })
+        for (const it of freshOrder.items) {
+          // `it.delivered` may be a real delivery OR a "⚠️ Недостаточно товара"
+          // warning from a previous incomplete attempt. Only skip re-delivery
+          // for real deliveries (so the admin can retry after restocking).
+          if (it.delivered && !it.delivered.startsWith("⚠️")) {
+            // already delivered (e.g. service "в работе") — just bump sales
+            await tx.product.update({
+              where: { id: it.productId },
+              data: { salesCount: { increment: it.qty } },
+            })
+            continue
+          }
+          const product = await tx.product.findUnique({
+            where: { id: it.productId },
+          })
+          if (product?.type === "service") {
+            await tx.orderItem.update({
+              where: { id: it.id },
+              data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
+            })
+            await tx.product.update({
+              where: { id: it.productId },
+              data: { salesCount: { increment: it.qty } },
+            })
+            continue
+          }
+          const stock = await tx.stockItem.findMany({
+            where: {
+              productId: it.productId,
+              status: { in: ["reserved", "available"] },
+            },
+            take: it.qty,
+          })
 
-      if (stock.length < it.qty) {
-        // Insufficient stock — flag and mark incomplete
-        console.warn(
-          `[admin/orders/${id}] insufficient stock for item ${it.id} (product ${it.productId}): have ${stock.length}, need ${it.qty}`
-        )
-        await db.orderItem.update({
-          where: { id: it.id },
-          data: { delivered: "⚠️ Недостаточно товара на складе" },
-        })
-        allDelivered = false
-        continue
-      }
+          if (stock.length < it.qty) {
+            // Insufficient stock — flag and mark incomplete
+            console.warn(
+              `[admin/orders/${id}] insufficient stock for item ${it.id} (product ${it.productId}): have ${stock.length}, need ${it.qty}`
+            )
+            await tx.orderItem.update({
+              where: { id: it.id },
+              data: { delivered: "⚠️ Недостаточно товара на складе" },
+            })
+            allDelivered = false
+            continue
+          }
 
-      await db.stockItem.updateMany({
-        where: { id: { in: stock.map((s) => s.id) } },
-        data: { status: "sold", soldAt: new Date(), reservedOrderId: null },
-      })
-      const content = stock.map((s) => s.content).join("\n")
-      await db.orderItem.update({
-        where: { id: it.id },
-        data: { delivered: content },
-      })
-      await db.product.update({
-        where: { id: it.productId },
-        data: { salesCount: { increment: it.qty } },
-      })
-    }
+          await tx.stockItem.updateMany({
+            where: { id: { in: stock.map((s) => s.id) } },
+            data: { status: "sold", soldAt: new Date(), reservedOrderId: null },
+          })
+          const content = stock.map((s) => s.content).join("\n")
+          await tx.orderItem.update({
+            where: { id: it.id },
+            data: { delivered: content },
+          })
+          await tx.product.update({
+            where: { id: it.productId },
+            data: { salesCount: { increment: it.qty } },
+          })
+        }
 
-    if (allDelivered) {
-      const updated = await db.order.update({
-        where: { id },
-        data: { status: "completed" },
-        include: { items: true, customer: true },
-      })
-      if (updated.customer) {
-        await db.customer.update({
-          where: { id: updated.customer.id },
-          data: {
-            totalSpent: { increment: updated.total },
-            ordersCount: { increment: 1 },
-          },
+        if (allDelivered) {
+          const upd = await tx.order.update({
+            where: { id },
+            data: { status: "completed" },
+            include: { items: true, customer: true },
+          })
+          if (upd.customer) {
+            await tx.customer.update({
+              where: { id: upd.customer.id },
+              data: {
+                totalSpent: { increment: upd.total },
+                ordersCount: { increment: 1 },
+              },
+            })
+          }
+          return upd
+        }
+
+        // Not fully delivered — keep status as "paid" and return current state
+        return await tx.order.update({
+          where: { id },
+          data: { status: "paid" },
+          include: { items: true, customer: true },
         })
-      }
+      })
+      updated = txResult
       return NextResponse.json({ order: updated })
+    } catch (e: any) {
+      console.error(`[admin/orders/${id}] complete tx failed:`, e)
+      return NextResponse.json(
+        { error: e?.message || "Не удалось завершить заказ" },
+        { status: 500 }
+      )
     }
-
-    // Not fully delivered — keep status as "paid" and return current state
-    const updated = await db.order.update({
-      where: { id },
-      data: { status: "paid" },
-      include: { items: true, customer: true },
-    })
-    return NextResponse.json({ order: updated })
   }
 
   if (action === "cancel") {

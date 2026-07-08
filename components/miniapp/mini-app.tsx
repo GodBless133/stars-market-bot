@@ -36,6 +36,8 @@ declare global {
         platform?: string
         themeParams?: any
         colorScheme?: "light" | "dark" | string
+        // FIX 1: initData is the HMAC-signed payload the server validates.
+        initData?: string
         initDataUnsafe?: any
         MainButton?: any
         BackButton?: any
@@ -118,6 +120,10 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
     if (tg) {
       tg.ready()
       tg.expand()
+      // FIX 1: initDataUnsafe is CLIENT-CONTROLLED and used here ONLY for
+      // cosmetic display (name/avatar). Authentication is handled server-side
+      // via the HMAC-signed initData header attached by lib/api-client.ts —
+      // the server ignores this tgUser.id for any auth decision.
       const u = tg.initDataUnsafe?.user
       if (u) {
         setTgUser({ id: String(u.id), firstName: u.first_name, username: u.username })

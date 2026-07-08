@@ -105,12 +105,14 @@ model Order {
   currency    String      @default("RUB")
   payMethod   String?     // card | stars | crypto | balance
   note        String?
+  starPaymentChargeId String?  // Telegram Stars charge id — needed for refundStarPayment
   items       OrderItem[]
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
   @@index([status])
   @@index([customerId])
+  @@index([customerTg])
 }
 
 model OrderItem {

@@ -21,34 +21,58 @@ if (!SMS_KEY) console.warn("[tg-bot] WARNING: SMS_API_KEY env var not set — SM
 async function smsOrderNumber(service: string, country: number): Promise<{ id: number; phone: string }> {
   const url = `${SMS_API}?api_key=${SMS_KEY}&action=getNumber&service=${service}&country=${country}`;
   console.log("[SMS] orderNumber:", { service, country });
-  const res = await fetch(url);
-  const text = await res.text();
-  console.log("[SMS] response:", text);
-  if (text.startsWith("ACCESS_NUMBER:")) {
-    const parts = text.split(":");
-    const id = parseInt(parts[1], 10);
-    if (!Number.isFinite(id) || !parts[2]) {
-      throw new Error("Некорректный ответ сервиса номеров: " + text);
+  // FIX 4: 15s timeout — if smsfast hangs, don't hang the bot.
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const text = await res.text();
+    console.log("[SMS] response:", text);
+    if (text.startsWith("ACCESS_NUMBER:")) {
+      const parts = text.split(":");
+      const id = parseInt(parts[1], 10);
+      if (!Number.isFinite(id) || !parts[2]) {
+        throw new Error("Некорректный ответ сервиса номеров: " + text);
+      }
+      return { id, phone: "+" + parts[2] };
     }
-    return { id, phone: "+" + parts[2] };
+    if (text === "NO_NUMBERS") throw new Error("Нет доступных номеров для этой страны. Попробуйте другую.");
+    if (text === "NO_BALANCE") throw new Error("Недостаточно средств на сервисе номеров.");
+    throw new Error("Ошибка: " + text);
+  } catch (e: any) {
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      throw new Error("Таймаут — сервис номеров не ответил за 15 сек");
+    }
+    throw e;
   }
-  if (text === "NO_NUMBERS") throw new Error("Нет доступных номеров для этой страны. Попробуйте другую.");
-  if (text === "NO_BALANCE") throw new Error("Недостаточно средств на сервисе номеров.");
-  throw new Error("Ошибка: " + text);
 }
 
 async function smsGetStatus(id: number): Promise<{ status: string; code?: string }> {
-  const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=getStatus&id=${id}`);
-  const text = await res.text();
-  if (text.startsWith("STATUS_OK:")) return { status: "ok", code: text.split(":")[1]?.trim() };
-  if (text === "STATUS_WAIT_CODE") return { status: "wait" };
-  if (text === "STATUS_CANCEL") return { status: "cancel" };
-  return { status: text };
+  // FIX 4: 15s timeout — if smsfast hangs, don't hang the poll loop.
+  try {
+    const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=getStatus&id=${id}`, { signal: AbortSignal.timeout(15000) });
+    const text = await res.text();
+    if (text.startsWith("STATUS_OK:")) return { status: "ok", code: text.split(":")[1]?.trim() };
+    if (text === "STATUS_WAIT_CODE") return { status: "wait" };
+    if (text === "STATUS_CANCEL") return { status: "cancel" };
+    return { status: text };
+  } catch (e: any) {
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      throw new Error("Таймаут — сервис номеров не ответил за 15 сек");
+    }
+    throw e;
+  }
 }
 
 async function smsSetStatus(id: number, status: number): Promise<string> {
-  const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=setStatus&id=${id}&status=${status}`);
-  return await res.text();
+  // FIX 4: 15s timeout — if smsfast hangs, don't hang the caller.
+  try {
+    const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=setStatus&id=${id}&status=${status}`, { signal: AbortSignal.timeout(15000) });
+    return await res.text();
+  } catch (e: any) {
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      throw new Error("Таймаут — сервис номеров не ответил за 15 сек");
+    }
+    throw e;
+  }
 }
 // === END SMS NUMBERS ===
 
@@ -524,6 +548,32 @@ async function setupBot() {
     await safeReplyLong(ctx, text);
   });
 
+  // /refund <orderId> — manual Stars refund for an order (admin only).
+  // FIX 1: needed because cancelOrder's auto-refund only fires for paid/completed orders,
+  // and because some edge cases (e.g. customer reports an issue post-completion) need a
+  // manual path. Requires starPaymentChargeId to have been persisted at payment time.
+  bot.command("refund", async (ctx) => {
+    const adminId = process.env.ADMIN_TG_ID?.trim();
+    const userId = String(ctx.from?.id ?? "");
+    if (!adminId || userId !== adminId) return;
+    const orderId = ctx.message?.text?.split(/\s+/)[1]?.trim();
+    if (!orderId) { await ctx.reply("Использование: /refund <orderId>"); return; }
+    try {
+      const order = await db.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, number: true, status: true, customerTg: true, starPaymentChargeId: true },
+      });
+      if (!order) { await ctx.reply("Заказ не найден"); return; }
+      if (!order.starPaymentChargeId) { await ctx.reply("У заказа нет Star payment charge id — вернуть нельзя."); return; }
+      if (!order.customerTg) { await ctx.reply("У заказа нет customerTg — вернуть нельзя."); return; }
+      await bot!.api.refundStarPayment(Number(order.customerTg), order.starPaymentChargeId);
+      await db.order.update({ where: { id: orderId }, data: { status: "refunded" } });
+      await ctx.reply(`✅ Рефанд выполнен.\nЗаказ: ${order.number}\nCharge: ${order.starPaymentChargeId}`);
+    } catch (e: any) {
+      await ctx.reply(`❌ Ошибка: ${String(e?.message || e).slice(0, 200)}`);
+    }
+  });
+
   // /legal — юридические документы
   bot.command("legal", async (ctx) => {
     const WEBAPP = process.env.WEBAPP_URL?.trim() || "";
@@ -651,8 +701,9 @@ async function setupBot() {
     const orderId = ctx.match[1];
     const userId = String(ctx.from?.id ?? "");
     // C3: authorization — only the order's owner can cancel it (prevents abuse via forwarded messages).
+    // FIX 2: fail-closed — if customerTg is null/missing, deny access instead of allowing it.
     const order = await db.order.findUnique({ where: { id: orderId }, select: { customerTg: true } });
-    if (!order || (order.customerTg && String(order.customerTg) !== userId)) {
+    if (!order || String(order.customerTg ?? "") !== userId) {
       await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
       return;
     }
@@ -834,7 +885,8 @@ async function setupBot() {
         return;
       }
       // C3: authorization — only the original buyer can request a login code for their account.
-      if (orderItem.order?.customerTg && String(orderItem.order.customerTg) !== userId) {
+      // FIX 2: fail-closed — if customerTg is null/missing, deny access instead of allowing it.
+      if (String(orderItem.order?.customerTg ?? "") !== userId) {
         await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
         return;
       }
@@ -937,74 +989,81 @@ async function setupBot() {
         pendingLinkRequests.delete(foundOrderId);
         return;
       }
-      
-      pendingLinkRequests.delete(foundOrderId);
+
+      // FIX 3: do NOT delete pendingLinkRequests yet — only delete AFTER smmCreateOrder
+      // succeeds. If we delete first and smmCreateOrder throws/errors, the user is stuck
+      // (can't retry by re-sending the link). Keep the entry so they can retry.
       await safeReply(ctx, "⏳ Создаю заказ на накрутку...");
-      
+
       // Заказываем через SMM API
       const result = await smmCreateOrder(req.smmServiceId, link, req.quantity);
-      
+
       if ("error" in result) {
+        // DON'T delete pendingLinkRequests — user can retry by sending the link again.
         await safeReply(
           ctx,
-          `❌ *Ошибка создания заказа*\n\nПричина: ${escapeMd(result.error)}\n\nОбратитесь в поддержку с номером заказа.`,
+          `⚠️ Не удалось создать заказ накрутки: ${escapeMd(result.error)}\n\nПопробуйте отправить ссылку ещё раз или обратитесь в поддержку.`,
           { reply_markup: mainMenuInline() }
         );
-      } else {
-        // Обновляем заказ — записываем SMM order ID
-        await db.orderItem.updateMany({
-          where: { orderId: req.orderId },
-          data: { delivered: `🚀 Заказ запущен!\nSMM Order: #${result.orderId}\nУслуга: ${req.productTitle}\nКоличество: ${req.quantity}\nСсылка: ${link}\nСтатус: In progress` },
+        return;
+      }
+
+      // Success — now safe to remove the pending entry.
+      pendingLinkRequests.delete(foundOrderId);
+
+      // Обновляем заказ — записываем SMM order ID
+      await db.orderItem.updateMany({
+        where: { orderId: req.orderId },
+        data: { delivered: `🚀 Заказ запущен!\nSMM Order: #${result.orderId}\nУслуга: ${req.productTitle}\nКоличество: ${req.quantity}\nСсылка: ${link}\nСтатус: In progress` },
+      });
+
+      // SMM order was created successfully — now (and only now) mark the order as completed.
+      // (Earlier the order was set to "paid" while waiting for the buyer's link.)
+      await db.order.update({ where: { id: req.orderId }, data: { status: "completed" } });
+
+      // H3: record the sale (product.salesCount + customer.totalSpent/ordersCount).
+      // deliverOrder() is NOT called on the boost path, so we have to bump these manually.
+      try {
+        // Fetch the order with items so recordSale can read customerId/total/firstItem.productId.
+        const saleOrder = await db.order.findUnique({
+          where: { id: req.orderId },
+          include: { items: true },
         });
-        
-        // SMM order was created successfully — now (and only now) mark the order as completed.
-        // (Earlier the order was set to "paid" while waiting for the buyer's link.)
-        await db.order.update({ where: { id: req.orderId }, data: { status: "completed" } });
-        
-        // H3: record the sale (product.salesCount + customer.totalSpent/ordersCount).
-        // deliverOrder() is NOT called on the boost path, so we have to bump these manually.
+        if (saleOrder) {
+          const firstItem = saleOrder.items[0];
+          if (firstItem) await recordSale(saleOrder, firstItem.productId, 1);
+        }
+      } catch (e: any) {
+        console.error("[boost] recordSale error:", e?.message || e);
+      }
+
+      await safeReply(
+        ctx,
+        `✅ *Заказ на накрутку запущен!*\n\n` +
+        `📋 Номер заказа: *${req.orderId.slice(-8).toUpperCase()}*\n` +
+        `🔢 SMM Order: #${result.orderId}\n` +
+        `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
+        `📊 Количество: ${req.quantity}\n` +
+        `🔗 Ссылка: ${escapeMd(link)}\n\n` +
+        `⏰ Накрутка выполняется в фоне. Обычно занимает от 30 минут до 24 часов.\n\n` +
+        `Проверить статус: /orders`,
+        { reply_markup: mainMenuInline() }
+      );
+
+      // Уведомление админу
+      const adminId = process.env.ADMIN_TG_ID?.trim();
+      if (adminId) {
         try {
-          // Fetch the order with items so recordSale can read customerId/total/firstItem.productId.
-          const saleOrder = await db.order.findUnique({
-            where: { id: req.orderId },
-            include: { items: true },
-          });
-          if (saleOrder) {
-            const firstItem = saleOrder.items[0];
-            if (firstItem) await recordSale(saleOrder, firstItem.productId, 1);
-          }
-        } catch (e: any) {
-          console.error("[boost] recordSale error:", e?.message || e);
-        }
-        
-        await safeReply(
-          ctx,
-          `✅ *Заказ на накрутку запущен!*\n\n` +
-          `📋 Номер заказа: *${req.orderId.slice(-8).toUpperCase()}*\n` +
-          `🔢 SMM Order: #${result.orderId}\n` +
-          `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
-          `📊 Количество: ${req.quantity}\n` +
-          `🔗 Ссылка: ${escapeMd(link)}\n\n` +
-          `⏰ Накрутка выполняется в фоне. Обычно занимает от 30 минут до 24 часов.\n\n` +
-          `Проверить статус: /orders`,
-          { reply_markup: mainMenuInline() }
-        );
-        
-        // Уведомление админу
-        const adminId = process.env.ADMIN_TG_ID?.trim();
-        if (adminId) {
-          try {
-            await safeSendMessage(ctx.api, adminId,
-              `🔔 *Новый заказ на накрутку*\n\n` +
-              `👤 Клиент: ${escapeMd(ctx.from?.first_name || "Unknown")} (${userId})\n` +
-              `📋 Заказ: ${req.orderId.slice(-8).toUpperCase()}\n` +
-              `🔢 SMM: #${result.orderId}\n` +
-              `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
-              `📊 Кол-во: ${req.quantity}\n` +
-              `🔗 Ссылка: ${escapeMd(link)}`
-            );
-          } catch (e) { console.error("Admin notify error:", e); }
-        }
+          await safeSendMessage(ctx.api, adminId,
+            `🔔 *Новый заказ на накрутку*\n\n` +
+            `👤 Клиент: ${escapeMd(ctx.from?.first_name || "Unknown")} (${userId})\n` +
+            `📋 Заказ: ${req.orderId.slice(-8).toUpperCase()}\n` +
+            `🔢 SMM: #${result.orderId}\n` +
+            `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
+            `📊 Кол-во: ${req.quantity}\n` +
+            `🔗 Ссылка: ${escapeMd(link)}`
+          );
+        } catch (e) { console.error("Admin notify error:", e); }
       }
       return;
     }
@@ -1111,6 +1170,17 @@ async function setupBot() {
       if (!order) {
         console.error("[tg-bot] successful_payment: order not found", parsed);
         return;
+      }
+      // FIX 1: persist the Telegram Stars charge id so we can refund it later
+      // (cancelOrder path + /refund admin command). Idempotent — safe to re-set on retries.
+      const chargeId = sp.telegram_payment_charge_id;
+      if (chargeId && order.starPaymentChargeId !== chargeId) {
+        try {
+          await db.order.update({ where: { id: order.id }, data: { starPaymentChargeId: chargeId } });
+          order.starPaymentChargeId = chargeId;
+        } catch (e: any) {
+          console.error("[tg-bot] successful_payment: failed to persist starPaymentChargeId:", e?.message || e);
+        }
       }
       if (order.status === "completed") {
         await safeReply(ctx, `✅ Этот заказ (${escapeMd(order.number)}) уже оплачен и доставлен.`);
@@ -2140,10 +2210,31 @@ async function cancelOrder(ctx: any, orderId: string) {
     data: { status: "available", reservedOrderId: null },
   });
 
+  // Capture the pre-cancel status so we can decide whether to refund Stars.
+  const preCancelStatus = order.status;
+
   await db.order.update({
     where: { id: orderId },
     data: { status: "cancelled" },
   });
+
+  // FIX 1: if the order was actually paid for with Telegram Stars, refund the user
+  // automatically. The bot.api.refundStarPayment call needs the user's numeric tgId
+  // and the persisted telegram_payment_charge_id.
+  if (order.starPaymentChargeId && (preCancelStatus === "paid" || preCancelStatus === "completed")) {
+    try {
+      const userId = Number(order.customerTg);
+      if (Number.isFinite(userId)) {
+        await bot!.api.refundStarPayment(userId, order.starPaymentChargeId);
+        await safeReply(ctx, `✅ Stars возвращены пользователю (charge ${order.starPaymentChargeId.slice(0, 8)}...).`);
+      } else {
+        await safeReply(ctx, `⚠️ У заказа нет корректного customerTg — Stars не возвращены автоматически. Верните вручную через @BotFather (charge: ${order.starPaymentChargeId}).`);
+      }
+    } catch (e: any) {
+      console.error("[cancelOrder] refund failed:", e?.message || e);
+      await safeReply(ctx, `⚠️ Не удалось вернуть Stars автоматически: ${String(e?.message || e).slice(0, 150)}\nВерните вручную через @BotFather.`);
+    }
+  }
 
   await safeReply(ctx, `Заказ ${escapeMd(order.number)} отменён. Запас возвращён на склад.`, {
     reply_markup: mainMenuInline(),

@@ -14,6 +14,15 @@ export async function GET(
       category: true,
       reviews: {
         where: { published: true },
+        // FIX 6: select only the fields needed for public display. Excludes
+        // customerId / tgId so reviewers' Telegram ids can never leak.
+        select: {
+          id: true,
+          author: true,
+          rating: true,
+          text: true,
+          createdAt: true,
+        },
         orderBy: { createdAt: "desc" },
         take: 50,
       },

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server"
 import { db } from "@/lib/db"
 import { genOrderNumber } from "@/lib/store"
+import { validateTelegramInitData } from "@/lib/telegram-auth"
 
 export const dynamic = "force-dynamic"
 
@@ -36,6 +37,22 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     )
   }
+
+  // FIX 1: validate Telegram initData. If present but invalid → 401. When
+  // valid the validated tg id overrides body.customerTg (no impersonation).
+  // Absent → fall back to body.customerTg for non-Telegram callers (logged).
+  const initData = req.headers.get("x-telegram-init-data") || ""
+  const validatedTgId = validateTelegramInitData(initData, botToken)
+  if (initData && !validatedTgId) {
+    return NextResponse.json({ error: "invalid telegram auth" }, { status: 401 })
+  }
+  const effectiveTgId = validatedTgId
+    ? String(validatedTgId)
+    : (customerTg || null)
+  if (!initData && customerTg) {
+    console.warn("[api/stars-invoice] no initData header; falling back to client-supplied customerTg")
+  }
+
   if (!items || !Array.isArray(items) || items.length === 0) {
     return NextResponse.json({ error: "Корзина пуста" }, { status: 400 })
   }
@@ -76,11 +93,11 @@ export async function POST(req: NextRequest) {
 
   // Resolve customer
   let customer = null
-  if (customerTg) {
+  if (effectiveTgId) {
     customer = await db.customer.upsert({
-      where: { tgId: customerTg },
+      where: { tgId: effectiveTgId },
       update: { firstName: customerName },
-      create: { tgId: customerTg, firstName: customerName },
+      create: { tgId: effectiveTgId, firstName: customerName },
     })
   }
 
@@ -98,7 +115,7 @@ export async function POST(req: NextRequest) {
         data: {
           number: genOrderNumber(),
           customerId: customer?.id,
-          customerTg: customerTg || null,
+          customerTg: effectiveTgId || null,
           customerName: customerName || null,
           status: "pending",
           total: totalRub,

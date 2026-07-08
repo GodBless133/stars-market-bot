@@ -119,14 +119,16 @@ export async function POST(req: NextRequest) {
     })
 
     // Create stock items
-    const count = Number(stockCount) || 0
-    for (let i = 0; i < count; i++) {
-      await db.stockItem.create({
-        data: {
+    // FIX 5: cap count to 1000 (protects against accidental huge loops and
+    // request timeouts) and use createMany for a single round-trip insert.
+    const count = Math.min(Number(stockCount) || 0, 1000)
+    if (count > 0) {
+      await db.stockItem.createMany({
+        data: Array.from({ length: count }, () => ({
           productId: product.id,
           content: `STOCK-${slug.toUpperCase()}-${randomUUID().slice(0, 10).toUpperCase()}`,
           status: "available",
-        },
+        })),
       })
     }
 

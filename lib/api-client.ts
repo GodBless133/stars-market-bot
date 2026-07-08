@@ -1,4 +1,12 @@
 // Tiny fetch wrapper used across client components
+
+// FIX 1: attach the Telegram Mini App initData on every request so the server
+// can validate the user via HMAC. Safe no-op outside Telegram.
+const getInitData = (): string => {
+  if (typeof window === "undefined") return "";
+  return window.Telegram?.WebApp?.initData || "";
+};
+
 async function request<T = any>(
   url: string,
   options?: RequestInit
@@ -7,6 +15,7 @@ async function request<T = any>(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      "x-telegram-init-data": getInitData(),
       ...(options?.headers || {}),
     },
   })

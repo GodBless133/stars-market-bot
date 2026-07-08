@@ -29,7 +29,9 @@ export function AdminReviews() {
     setLoading(true)
     api
       .get<{ reviews: Review[] }>(
-        `/api/reviews${filter === "published" ? "?published=1" : filter === "hidden" ? "?published=0" : ""}`
+        // FIX 2: fetch from admin endpoint so hidden/unpublished reviews are
+        // visible for moderation. /api/reviews now forces published=true.
+        `/api/admin/reviews${filter === "published" ? "?published=1" : filter === "hidden" ? "?published=0" : ""}`
       )
       .then((d) => {
         // attach product title — reviews endpoint doesn't include product, fetch separately

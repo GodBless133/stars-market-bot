@@ -34,7 +34,8 @@ export async function getBalance(): Promise<{ balance: number; currency: string 
     const url = `${SMM_API_URL}?key=${SMM_API_KEY}&action=balance`;
     // Do NOT log the URL — it contains the API key.
     console.log("[SMM] getBalance request (key redacted)");
-    const res = await fetch(url);
+    // FIX 4: 15s timeout — if twiboost hangs, don't hang the bot.
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
     const data = await res.json();
     console.log("[SMM] getBalance response:", JSON.stringify(data));
     if (data.error) return { error: data.error };
@@ -42,8 +43,12 @@ export async function getBalance(): Promise<{ balance: number; currency: string 
     if (!Number.isFinite(bal)) return { error: "Invalid balance response" };
     return { balance: bal, currency: data.currency };
   } catch (e: any) {
-    console.error("[SMM] getBalance error:", e.message);
-    return { error: e.message };
+    console.error("[SMM] getBalance error:", e?.message || e);
+    // FIX 4: surface a friendlier message on timeout/abort.
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      return { error: "Таймаут — сервис не ответил за 15 сек" };
+    }
+    return { error: e?.message || String(e) };
   }
 }
 
@@ -61,11 +66,12 @@ export async function createOrder(
     const url = `${SMM_API_URL}?key=${SMM_API_KEY}&action=add&service=${serviceId}&link=${encodeURIComponent(link)}&quantity=${quantity}`;
     // Do NOT log the URL — it contains the API key.
     console.log("[SMM] createOrder request (key redacted)", { serviceId, quantity });
-    
-    const res = await fetch(url);
+
+    // FIX 4: 15s timeout — if twiboost hangs, don't hang the bot.
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
     const text = await res.text();
     console.log("[SMM] createOrder raw response:", text);
-    
+
     const data = JSON.parse(text);
     if (data.error) {
       console.error("[SMM] createOrder API error:", data.error);
@@ -78,8 +84,12 @@ export async function createOrder(
     console.log("[SMM] createOrder success! Order ID:", data.order);
     return { orderId: data.order };
   } catch (e: any) {
-    console.error("[SMM] createOrder exception:", e.message);
-    return { error: e.message };
+    console.error("[SMM] createOrder exception:", e?.message || e);
+    // FIX 4: surface a friendlier message on timeout/abort.
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      return { error: "Таймаут — сервис не ответил за 15 сек" };
+    }
+    return { error: e?.message || String(e) };
   }
 }
 
@@ -96,7 +106,8 @@ export async function getOrderStatus(
 } | { error: string }> {
   try {
     const url = `${SMM_API_URL}?key=${SMM_API_KEY}&action=status&order=${orderId}`;
-    const res = await fetch(url);
+    // FIX 4: 15s timeout — if twiboost hangs, don't hang the bot (esp. the 5-min poll loop).
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
     const data = await res.json();
     if (data.error) return { error: data.error };
     const startCount = data.start_count ? parseInt(data.start_count) : undefined;
@@ -109,7 +120,11 @@ export async function getOrderStatus(
       charge: charge !== undefined && Number.isFinite(charge) ? charge : undefined,
     };
   } catch (e: any) {
-    return { error: e.message };
+    // FIX 4: surface a friendlier message on timeout/abort.
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      return { error: "Таймаут — сервис не ответил за 15 сек" };
+    }
+    return { error: e?.message || String(e) };
   }
 }
 

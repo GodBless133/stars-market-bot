@@ -16,10 +16,15 @@ fi
 echo "→ prisma generate"
 npx prisma generate
 
-# Create tables. NOTE: --accept-data-loss was removed — db push is now safe by default.
-# The schema's declared provider (postgresql) must match DATABASE_URL at deploy time.
-echo "→ prisma db push"
-npx prisma db push --skip-generate 2>&1 || echo "⚠️ db push warning"
+# FIX 5: in production, use `prisma migrate deploy` (safe — only applies existing
+# migrations, never auto-diffs the schema). Fall back to `db push` only if no migrations
+# exist yet (dev/first-deploy). Auto-running db push on every boot is dangerous in prod
+# because schema drift in the codebase could trigger data loss.
+echo "→ prisma migrate deploy"
+npx prisma migrate deploy 2>&1 || {
+  echo "⚠️ migrate deploy failed — falling back to db push (dev only)"
+  npx prisma db push --skip-generate 2>&1 || echo "⚠️ db push warning"
+}
 
 # Install tsx if not present
 if ! npx tsx --version &>/dev/null; then

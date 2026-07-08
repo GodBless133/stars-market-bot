@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server"
 import { db } from "@/lib/db"
+import { validateTelegramInitData } from "@/lib/telegram-auth"
 
 export const dynamic = "force-dynamic"
 
@@ -36,6 +37,20 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Оценка от 1 до 5 (целое число)" }, { status: 400 })
   }
 
+  // FIX 1: validate Telegram initData. If present but invalid → 401. When
+  // valid the validated tg id overrides body.tgId. Absent → fall back to
+  // body.tgId (anonymous review still allowed for non-Telegram callers).
+  const botToken = process.env.BOT_TOKEN || ""
+  const initData = req.headers.get("x-telegram-init-data") || ""
+  const validatedTgId = validateTelegramInitData(initData, botToken)
+  if (initData && !validatedTgId) {
+    return NextResponse.json({ error: "invalid telegram auth" }, { status: 401 })
+  }
+  const effectiveTgId = validatedTgId ? String(validatedTgId) : (tgId || null)
+  if (!initData && tgId) {
+    console.warn("[api/reviews POST] no initData header; falling back to client-supplied tgId")
+  }
+
   // FIX 11: rate-limit by IP regardless of tgId presence
   const ip = getClientIp(req)
   const now = Date.now()
@@ -55,13 +70,13 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Создаём/находим клиента если есть tgId
+  // Создаём/находим клиента если есть effectiveTgId
   let customer = null
-  if (tgId) {
+  if (effectiveTgId) {
     customer = await db.customer.upsert({
-      where: { tgId },
+      where: { tgId: effectiveTgId },
       update: { firstName: author },
-      create: { tgId, firstName: author },
+      create: { tgId: effectiveTgId, firstName: author },
     })
   }
 
@@ -70,7 +85,7 @@ export async function POST(req: NextRequest) {
       productId: productId || null,
       customerId: customer?.id || null,
       author: author.trim().slice(0, 50),
-      tgId: tgId || null,
+      tgId: effectiveTgId || null,
       rating: Math.round(rating),
       text: text.trim().slice(0, 500),
       published: true,
@@ -95,22 +110,30 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({ review, ok: true })
 }
 
-// List reviews
+// List reviews — PUBLIC endpoint. FIX 2: force published=true so hidden /
+// pending-moderation reviews can never leak. Admin uses /api/admin/reviews.
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url)
   const productId = searchParams.get("productId")
-  const published = searchParams.get("published")
 
-  const where: any = {}
+  const where: any = { published: true }
   if (productId) where.productId = productId
-  if (published === "1") where.published = true
-  if (published === "0") where.published = false
 
   const reviews = await db.review.findMany({
     where,
     orderBy: { createdAt: "desc" },
     take: 100,
-    include: { product: { select: { title: true, image: true } } },
+    // FIX 6: never expose reviewer tgId / customerId on the public endpoint.
+    select: {
+      id: true,
+      author: true,
+      rating: true,
+      text: true,
+      createdAt: true,
+      productId: true,
+      published: true,
+      product: { select: { title: true, image: true } },
+    },
   })
   return NextResponse.json({ reviews })
 }
