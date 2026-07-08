@@ -13,24 +13,31 @@ export async function GET(req: NextRequest) {
 
   const where: any = {}
   if (q) {
-    where.OR = [{ title: { contains: q } }, { description: { contains: q } }]
+    where.OR = [{ title: { contains: q, mode: "insensitive" } }, { description: { contains: q, mode: "insensitive" } }]
   }
   if (active === "1") where.active = true
   if (active === "0") where.active = false
 
-  const products = await db.product.findMany({
-    where,
-    orderBy: { createdAt: "desc" },
-    include: {
-      category: true,
-      _count: { select: { stock: { where: { status: "available" } } } },
-    },
-  })
+  // FIX: was `include: { _count: { select: { stock: { where: { status: "available" } } } } }`
+  // — filtered relation count caused N+1 subqueries and hung for 45+ seconds on
+  // 6000+ stock items. Replaced with a single groupBy for available stock counts.
+  const [products, stockCounts] = await Promise.all([
+    db.product.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      include: { category: true },
+    }),
+    db.stockItem.groupBy({
+      by: ["productId"],
+      where: { status: "available" },
+      _count: { _all: true },
+    }),
+  ])
+  const stockMap = new Map(stockCounts.map((s) => [s.productId, s._count._all]))
   return NextResponse.json({
     products: products.map((p) => ({
       ...p,
-      inStock: p._count.stock,
-      _count: undefined,
+      inStock: stockMap.get(p.id) ?? 0,
     })),
   })
 }

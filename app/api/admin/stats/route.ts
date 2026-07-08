@@ -13,6 +13,7 @@ export async function GET() {
     completedOrders,
     revenueAgg,
     lowStockProducts,
+    stockCounts,
   ] = await Promise.all([
     db.product.count(),
     db.order.count(),
@@ -26,14 +27,20 @@ export async function GET() {
     }),
     db.product.findMany({
       where: { active: true },
-      include: { _count: { select: { stock: { where: { status: "available" } } } } },
       take: 100,
+      select: { id: true, title: true },
+    }),
+    db.stockItem.groupBy({
+      by: ["productId"],
+      where: { status: "available" },
+      _count: { _all: true },
     }),
   ])
 
+  const stockMap = new Map(stockCounts.map((s) => [s.productId, s._count._all]))
   const lowStock = lowStockProducts
-    .filter((p) => p._count.stock <= 3)
-    .map((p) => ({ id: p.id, title: p.title, inStock: p._count.stock }))
+    .map((p) => ({ id: p.id, title: p.title, inStock: stockMap.get(p.id) ?? 0 }))
+    .filter((p) => p.inStock <= 3)
 
   // Revenue last 14 days
   const since = new Date()

@@ -28,31 +28,31 @@ export async function GET(req: NextRequest) {
   if (sort === "rating") orderBy = { rating: "desc" }
   if (sort === "new") orderBy = { createdAt: "desc" }
 
-  const products = await db.product.findMany({
-    where,
-    orderBy,
-    include: { category: true },
-  })
+  // Single groupBy for available stock counts — avoids N+1 queries on 6000+ stock items.
+  const [products, stockCounts] = await Promise.all([
+    db.product.findMany({
+      where,
+      orderBy,
+      include: { category: true },
+    }),
+    db.stockItem.groupBy({
+      by: ["productId"],
+      where: { status: "available" },
+      _count: { _all: true },
+    }),
+  ])
+  const stockMap = new Map(stockCounts.map((s) => [s.productId, s._count._all]))
 
-  const withStock = await Promise.all(
-    products.map(async (p) => {
-      // Для услуг и виртуальных номеров — всегда 99999 в наличии
-      if (p.type === "service" || p.slug.includes("nomer") || p.slug.includes("number") || p.slug.includes("virtual")) {
-        return { ...p, inStock: 99999 }
-      }
-      const available = await db.stockItem.count({
-        where: { productId: p.id, status: "available" },
-      })
-      return { ...p, inStock: available }
-    })
-  )
-
-  // Скрываем товары с stock=0 (кроме услуг и виртуальных номеров)
-  const visible = withStock.filter(p =>
+  const isVirtualOrService = (p: any) =>
     p.type === "service" ||
-    p.slug.includes("nomer") || p.slug.includes("number") || p.slug.includes("virtual") ||
-    p.inStock > 0
-  )
+    p.slug.includes("nomer") || p.slug.includes("number") || p.slug.includes("virtual")
+
+  const visible = products
+    .map((p) => ({
+      ...p,
+      inStock: isVirtualOrService(p) ? 99999 : (stockMap.get(p.id) ?? 0),
+    }))
+    .filter((p) => isVirtualOrService(p) || p.inStock > 0)
 
   return NextResponse.json({ products: visible })
 }
