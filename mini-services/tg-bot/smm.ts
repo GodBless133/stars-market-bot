@@ -15,6 +15,9 @@ export const SMM_SERVICES: Record<string, { serviceId: string; name: string; pri
   "tg-views-10000": { serviceId: "1612", name: "Накрутка просмотров 10000", pricePer1000: 6.5, min: 50, max: 100000 },
   "tg-views-50000": { serviceId: "1612", name: "Накрутка просмотров 50000", pricePer1000: 6.5, min: 50, max: 100000 },
   // Реакции
+  "tg-react-50": { serviceId: "2817", name: "Накрутка реакций 50", pricePer1000: 1.2, min: 1, max: 150000 },
+  "tg-react-100": { serviceId: "2817", name: "Накрутка реакций 100", pricePer1000: 1.2, min: 1, max: 150000 },
+  "tg-react-150": { serviceId: "2817", name: "Накрутка реакций 150", pricePer1000: 1.2, min: 1, max: 150000 },
   "tg-react-1000": { serviceId: "2817", name: "Накрутка реакций 1000", pricePer1000: 1.2, min: 1, max: 150000 },
   // Premium подписчики
   "tg-premium-subs-1000": { serviceId: "1292", name: "Накрутка Premium подписчиков 1000", pricePer1000: 7.6, min: 1, max: 100000 },

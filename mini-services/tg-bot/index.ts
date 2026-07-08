@@ -1296,6 +1296,9 @@ async function setupBot() {
         else if (product.title.includes("5000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-5000"; quantity = 5000; }
         else if (product.title.includes("10000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-10000"; quantity = 10000; }
         else if (product.title.includes("1000") && product.title.includes("реакц")) { smmServiceKey = "tg-react-1000"; quantity = 1000; }
+        else if (product.title.includes("150") && product.title.includes("реакц")) { smmServiceKey = "tg-react-150"; quantity = 150; }
+        else if (product.title.includes("100") && product.title.includes("реакц")) { smmServiceKey = "tg-react-100"; quantity = 100; }
+        else if (product.title.includes("50") && product.title.includes("реакц")) { smmServiceKey = "tg-react-50"; quantity = 50; }
         
         if (smmServiceKey && SMM_SERVICES[smmServiceKey]) {
           // C1: key by order.id (not tgId) so a second boost order can't overwrite the first.
