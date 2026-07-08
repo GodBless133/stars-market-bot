@@ -139,6 +139,28 @@ function escapeMd(s: string): string {
   return String(s ?? "").replace(/([_*`\[\]()~>#+\-=|{}.!\\])/g, "\\$1");
 }
 
+// safeReply: try Markdown first; if Telegram rejects the formatting (e.g. unmatched
+// *, _, ` from dynamic content like phone numbers or error messages), retry as plain
+// text so the user ALWAYS gets the message instead of a silent failure.
+async function safeReply(ctx: any, text: string, extra: any = {}) {
+  try {
+    return await ctx.reply(text, { parse_mode: "Markdown", ...extra });
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("can't parse entities") || msg.includes("Bad Request") || msg.includes("can't parse")) {
+      try {
+        // Strip Markdown markers for the plain-text fallback so the user doesn't see literal * _ `
+        const plain = text.replace(/[*_`]/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+        return await ctx.reply(plain, { ...extra, parse_mode: undefined });
+      } catch (e2: any) {
+        console.error("[safeReply] plain-text retry also failed:", e2?.message || e2);
+        throw e2;
+      }
+    }
+    throw e;
+  }
+}
+
 // ---------- Bot setup ----------
 async function setupBot() {
   // Guard against double invocation — multiple setupBot() calls would create duplicate
@@ -984,7 +1006,8 @@ async function setupBot() {
             .row()
             .text("❌ Отменить", `cancelnum:${order.id}`);
           
-          await ctx.reply(
+          await safeReply(
+            ctx,
             `📱 *Виртуальный номер заказан!*\n\n` +
             `📞 Номер: *${result.phone}*\n` +
             `🔧 ID: ${result.id}\n\n` +
@@ -998,9 +1021,10 @@ async function setupBot() {
           pollSMS(order.id, ctx);
         } catch (e: any) {
           console.error("[tg-bot] SMS order error:", e);
-          await ctx.reply(
+          await safeReply(
+            ctx,
             `⚠️ Не удалось заказать номер: ${e.message}\n\nОбратитесь в поддержку.`,
-            { parse_mode: "Markdown", reply_markup: mainMenuInline() }
+            { reply_markup: mainMenuInline() }
           );
         }
         return;
@@ -1035,7 +1059,8 @@ async function setupBot() {
           // the buyer sends a link AND smmCreateOrder succeeds (see link-handler above).
           await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
           
-          await ctx.reply(
+          await safeReply(
+            ctx,
             `🚀 *Заказ на накрутку оплачен!*\n\n` +
             `Услуга: *${product.title}*\n` +
             `Номер: *${order.number}*\n\n` +
@@ -1043,13 +1068,13 @@ async function setupBot() {
             `• Для подписчиков: @username или https://t.me/канал\n` +
             `• Для просмотров: https://t.me/канал/123\n` +
             `• Для реакций: https://t.me/канал/123\n\n` +
-            `_Накрутка начнётся автоматически после получения ссылки._`,
-            { parse_mode: "Markdown" }
+            `_Накрутка начнётся автоматически после получения ссылки._`
           );
         } else {
-          await ctx.reply(
+          await safeReply(
+            ctx,
             `⚠️ Услуга не найдена в SMM системе. Обратитесь в поддержку.\n\nЗаказ: ${order.number}`,
-            { parse_mode: "Markdown", reply_markup: mainMenuInline() }
+            { reply_markup: mainMenuInline() }
           );
         }
         return;
@@ -1070,12 +1095,12 @@ async function setupBot() {
       if (orderNum) {
         try { const o = await db.order.findUnique({ where: { id: orderNum }, select: { number: true } }); if (o) orderNumber = o.number; } catch {}
       }
-      await ctx.reply(
+      await safeReply(
+        ctx,
         `⚠️ Ошибка при выдаче товара.\n\n` +
         `Заказ: *${orderNumber}*\n` +
         `Причина: ${String(e?.message || e).slice(0, 200)}\n\n` +
-        `Напишите в поддержку с этим номером заказа.`,
-        { parse_mode: "Markdown" }
+        `Напишите в поддержку с этим номером заказа.`
       );
     }
   });
@@ -1799,9 +1824,9 @@ async function sendDeliveryMessage(ctx: any, order: any) {
       kb.text("📱 Получить код входа", `getcode:${itemId}`).row();
     }
     kb.text("💬 Поддержка", "support");
-    await ctx.reply(summary, { parse_mode: "Markdown", reply_markup: kb });
+    await safeReply(ctx, summary, { reply_markup: kb });
   } else {
-    await ctx.reply(summary, { parse_mode: "Markdown" });
+    await safeReply(ctx, summary);
     await ctx.reply("Если есть вопросы — нажмите 💬 Поддержка.", {
       reply_markup: mainMenuInline(),
     });
