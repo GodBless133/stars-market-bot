@@ -26,7 +26,7 @@ async function smsOrderNumber(service: string, country: number): Promise<{ id: n
   console.log("[SMS] response:", text);
   if (text.startsWith("ACCESS_NUMBER:")) {
     const parts = text.split(":");
-    const id = parseInt(parts[1]);
+    const id = parseInt(parts[1], 10);
     if (!Number.isFinite(id) || !parts[2]) {
       throw new Error("Некорректный ответ сервиса номеров: " + text);
     }
@@ -40,7 +40,7 @@ async function smsOrderNumber(service: string, country: number): Promise<{ id: n
 async function smsGetStatus(id: number): Promise<{ status: string; code?: string }> {
   const res = await fetch(`${SMS_API}?api_key=${SMS_KEY}&action=getStatus&id=${id}`);
   const text = await res.text();
-  if (text.startsWith("STATUS_OK:")) return { status: "ok", code: text.split(":")[1] };
+  if (text.startsWith("STATUS_OK:")) return { status: "ok", code: text.split(":")[1]?.trim() };
   if (text === "STATUS_WAIT_CODE") return { status: "wait" };
   if (text === "STATUS_CANCEL") return { status: "cancel" };
   return { status: text };
@@ -62,11 +62,15 @@ let bot: Bot | null = null;
 // Pending uploads for admin mode: userId → { productId, productTitle }
 const pendingUploads = new Map<string, { productId: string; productTitle: string }>();
 
-// Pending SMS orders: orderId → { activationId, phone, attempts, chatId }
-const pendingSMSOrders = new Map<string, { activationId: number; phone: string; attempts: number; chatId: number; tgId: string; country: number }>();
+// Pending SMS orders: orderId → { activationId, phone, attempts, chatId, gen }
+// H1: `gen` is a generation counter — incremented on chgnum so an in-flight pollSMS
+// from the previous number can detect it's stale and abort (prevents duplicate SMS delivery).
+const pendingSMSOrders = new Map<string, { activationId: number; phone: string; attempts: number; chatId: number; tgId: string; country: number; gen: number }>();
 
-// Pending link requests for SMM orders: userId → { orderId, productTitle, smmServiceKey, smmServiceId, quantity }
-const pendingLinkRequests = new Map<string, { orderId: string; productTitle: string; smmServiceKey: string; smmServiceId: string; quantity: number }>();
+// Pending link requests for SMM orders: orderId → { ..., tgId }
+// C1: keyed by orderId (not tgId) so a user's second boost order doesn't overwrite
+// the first one and leave it stuck forever. tgId is stored in the value for lookup.
+const pendingLinkRequests = new Map<string, { orderId: string; productTitle: string; smmServiceKey: string; smmServiceId: string; quantity: number; tgId: string }>();
 
 // Pending session uploads: userId → { productId, phone, password, twoFA }
 const pendingSessionUploads = new Map<string, { productId: string; phone: string; password: string; twoFA: string }>();
@@ -161,6 +165,57 @@ async function safeReply(ctx: any, text: string, extra: any = {}) {
   }
 }
 
+// H5: safeSendMessage — same fallback logic as safeReply, but for ctx.api.sendMessage
+// (used by the SMM poll loop and admin notifications to push messages to a chatId).
+async function safeSendMessage(api: any, chatId: number | string, text: string, extra: any = {}) {
+  try {
+    return await api.sendMessage(chatId, text, { parse_mode: "Markdown", ...extra });
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("can't parse") || msg.includes("Bad Request")) {
+      try {
+        const plain = text.replace(/[*_`]/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+        return await api.sendMessage(chatId, plain, { ...extra, parse_mode: undefined });
+      } catch (e2: any) {
+        console.error("[safeSendMessage] retry failed:", e2?.message || e2);
+      }
+    }
+    throw e;
+  }
+}
+
+// H6: safeReplyLong — Telegram caps messages at 4096 chars. Split a long message
+// on double-newline boundaries into chunks <= MAX chars and send them sequentially.
+// Only the last chunk carries `extra` (e.g. reply_markup) so the keyboard shows once.
+async function safeReplyLong(ctx: any, text: string, extra: any = {}) {
+  const MAX = 3800;
+  if (text.length <= MAX) return safeReply(ctx, text, extra);
+  // Split on double newline boundaries
+  const parts: string[] = [];
+  let buf = "";
+  for (const para of text.split("\n\n")) {
+    if ((buf + "\n\n" + para).length > MAX) {
+      if (buf) parts.push(buf);
+      buf = para;
+    } else {
+      buf = buf ? buf + "\n\n" + para : para;
+    }
+  }
+  if (buf) parts.push(buf);
+  for (let i = 0; i < parts.length; i++) {
+    await safeReply(ctx, parts[i], i === parts.length - 1 ? extra : {});
+  }
+}
+
+// H9: catch stray promise rejections / uncaught exceptions so they at least get logged
+// instead of crashing the process silently.
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
 // ---------- Bot setup ----------
 async function setupBot() {
   // Guard against double invocation — multiple setupBot() calls would create duplicate
@@ -185,11 +240,10 @@ async function setupBot() {
   bot.command("start", async (ctx) => {
     const s = await getSettings();
     const text =
-      `👋 Добро пожаловать в *${s.storeName}*!\n\n` +
-      `${s.tagline}\n\n` +
+      `👋 Добро пожаловать в *${escapeMd(s.storeName)}*!\n\n` +
+      `${escapeMd(s.tagline)}\n\n` +
       `Выберите действие из меню ниже 👇`;
-    await ctx.reply(text, {
-      parse_mode: "Markdown",
+    await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
   });
@@ -206,8 +260,7 @@ async function setupBot() {
       `📦 Мои заказы — последние заказы\n` +
       `💬 Поддержка — контакт поддержки\n` +
       `🌐 Открыть магазин — открыть веб-приложение`;
-    await ctx.reply(text, {
-      parse_mode: "Markdown",
+    await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
   });
@@ -218,9 +271,9 @@ async function setupBot() {
   // /admin — главное меню админа
   bot.command("admin", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ У вас нет доступа к админ-панели.");
+      await safeReply(ctx, "⛔ У вас нет доступа к админ-панели.");
       return;
     }
     await showAdminMenu(ctx);
@@ -229,61 +282,61 @@ async function setupBot() {
   // /addstock <productId> — режим добавления аккаунтов
   bot.command("addstock", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ Доступ запрещён.");
+      await safeReply(ctx, "⛔ Доступ запрещён.");
       return;
     }
     const args = ctx.match?.trim().split(/\s+/) || [];
     if (args.length === 0) {
-      await ctx.reply(
+      await safeReply(
+        ctx,
         "📝 *Добавление аккаунтов на склад\n\n*" +
         "Использование:\n" +
         "`/addstock PRODUCT_ID`\n\n" +
         "После этого отправьте текст с аккаунтами (по одному на строку).\n\n" +
-        "Чтобы узнать PRODUCT_ID — используйте `/products`",
-        { parse_mode: "Markdown" }
+        "Чтобы узнать PRODUCT_ID — используйте `/products`"
       );
       return;
     }
     const productId = args[0];
     const product = await db.product.findUnique({ where: { id: productId } });
     if (!product) {
-      await ctx.reply("❌ Товар не найден. Используйте `/products` для списка ID.", { parse_mode: "Markdown" });
+      await safeReply(ctx, "❌ Товар не найден. Используйте `/products` для списка ID.");
       return;
     }
     // Сохраняем режим — ждём следующее сообщение с аккаунтами
     pendingUploads.set(userId, { productId, productTitle: product.title });
-    await ctx.reply(
+    await safeReply(
+      ctx,
       `📝 *Режим загрузки аккаунтов*\n\n` +
-      `Товар: *${product.title}*\n` +
-      `ID: \`${productId}\`\n\n` +
+      `Товар: *${escapeMd(product.title)}*\n` +
+      `ID: \`${escapeMd(productId)}\`\n\n` +
       `Отправьте следующее сообщение с аккаунтами.\n` +
       `Формат — по одному на строку:\n\n` +
       `_login:pass\nlogin:pass\nlogin:pass_\n\n` +
-      `Или пришлите /cancel для отмены.`,
-      { parse_mode: "Markdown" }
+      `Или пришлите /cancel для отмены.`
     );
   });
 
   // /uploadsession <productId> <phone> [password] [2FA] — загрузка сессии аккаунта
   bot.command("uploadsession", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ Доступ запрещён.");
+      await safeReply(ctx, "⛔ Доступ запрещён.");
       return;
     }
     const args = ctx.match?.trim().split(/\s+/) || [];
     if (args.length < 2) {
-      await ctx.reply(
+      await safeReply(
+        ctx,
         "📝 *Загрузка аккаунта с сессией*\n\n" +
         "Формат:\n" +
         "`/uploadsession PRODUCT_ID PHONE [PASSWORD] [2FA]`\n\n" +
         "Пример:\n" +
         "`/uploadsession abc123 +79123456789 MyPass123 TwoFA456`\n\n" +
-        "После этого пришлите .session файл как документ.",
-        { parse_mode: "Markdown" }
+        "После этого пришлите .session файл как документ."
       );
       return;
     }
@@ -294,27 +347,27 @@ async function setupBot() {
     
     const product = await db.product.findUnique({ where: { id: productId } });
     if (!product) {
-      await ctx.reply("❌ Товар не найден. Используйте `/products`.", { parse_mode: "Markdown" });
+      await safeReply(ctx, "❌ Товар не найден. Используйте `/products`.");
       return;
     }
     
     pendingSessionUploads.set(userId, { productId, phone, password, twoFA });
-    await ctx.reply(
+    await safeReply(
+      ctx,
       `📱 *Загрузка аккаунта*\n\n` +
-      `Товар: *${product.title}*\n` +
-      `Телефон: ${phone}\n` +
+      `Товар: *${escapeMd(product.title)}*\n` +
+      `Телефон: ${escapeMd(phone)}\n` +
       `Пароль: ${password ? "✓" : "нет"}\n` +
       `2FA: ${twoFA ? "✓" : "нет"}\n\n` +
       `Теперь пришлите .session файл как документ.\n` +
-      `Или /cancel для отмены.`,
-      { parse_mode: "Markdown" }
+      `Или /cancel для отмены.`
     );
   });
 
   // Обработка документа (.session файла)
   bot.on("message:document", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     
     if (!adminId || userId !== adminId || !pendingSessionUploads.has(userId)) {
       return;
@@ -325,22 +378,31 @@ async function setupBot() {
     const fileName = doc.file_name || "unknown";
     
     if (!fileName.endsWith(".session") && !fileName.endsWith(".txt")) {
-      await ctx.reply("❌ Ожидается .session файл. Попробуйте ещё раз или /cancel");
+      await safeReply(ctx, "❌ Ожидается .session файл. Попробуйте ещё раз или /cancel");
       return;
     }
     
     try {
+      // M6: file-size guard — reject files >1 MB up-front to avoid huge fetches.
+      if (doc.file_size && doc.file_size > 1_000_000) {
+        await safeReply(ctx, "⚠️ Файл слишком большой (макс 1 МБ).");
+        return;
+      }
       // Скачиваем файл
       const fileUrl = await ctx.api.getFile(doc.file_id);
-      const fileResp = await fetch(`https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${fileUrl.file_path}`);
-      const sessionData = await fileResp.text();
+      // M4: use the trimmed BOT_TOKEN constant, not the raw env var (which may have whitespace).
+      const fileResp = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${fileUrl.file_path}`);
+      // M5: read as binary buffer, then base64-encode for safe DB storage.
+      // mtproto.ts should base64-decode this before using it as a StringSession.
+      const buf = Buffer.from(await fileResp.arrayBuffer());
+      const sessionContent = buf.toString("base64");
       
-      if (sessionData.length < 50) {
-        await ctx.reply("❌ Session файл слишком короткий. Проверьте содержимое.");
+      if (sessionContent.length < 50) {
+        await safeReply(ctx, "❌ Session файл слишком короткий. Проверьте содержимое.");
         return;
       }
       
-      // Создаём StockItem с данными аккаунта (sessionData хранится в sessionFile)
+      // Создаём StockItem с данными аккаунта (sessionContent — base64-строка — хранится в sessionFile)
       const stockItem = await db.stockItem.create({
         data: {
           productId: upload.productId,
@@ -349,7 +411,7 @@ async function setupBot() {
           phone: upload.phone,
           password: upload.password || null,
           twoFA: upload.twoFA || null,
-          sessionFile: sessionData.trim(), // StringSession хранится прямо в БД
+          sessionFile: sessionContent, // base64-encoded StringSession хранится прямо в БД
         },
       });
       
@@ -359,28 +421,28 @@ async function setupBot() {
         where: { productId: upload.productId, status: "available" },
       });
       
-      await ctx.reply(
+      await safeReply(
+        ctx,
         `✅ *Аккаунт загружен!*\n\n` +
         `Товар: ${upload.productId}\n` +
         `Телефон: ${upload.phone}\n` +
         `Session: ${fileName}\n` +
         `ID склада: ${stockItem.id}\n\n` +
         `Всего на складе: ${totalStock}\n\n` +
-        `Используйте /uploadsession для ещё одного аккаунта.`,
-        { parse_mode: "Markdown" }
+        `Используйте /uploadsession для ещё одного аккаунта.`
       );
     } catch (e: any) {
       console.error("Session upload error:", e);
-      await ctx.reply(`❌ Ошибка: ${e.message}`);
+      await safeReply(ctx, `❌ Ошибка: ${String(e?.message || e).slice(0, 200)}`);
     }
   });
 
   // /products — список всех товаров с ID
   bot.command("products", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ Доступ запрещён.");
+      await safeReply(ctx, "⛔ Доступ запрещён.");
       return;
     }
     const products = await db.product.findMany({
@@ -391,20 +453,21 @@ async function setupBot() {
     let text = "📋 *Список товаров:*\n\n";
     for (const p of products) {
       const stock = p.type === "service" ? "услуга" : await db.stockItem.count({ where: { productId: p.id, status: "available" } });
-      text += `*${p.title}*\n`;
-      text += `  ID: \`${p.id}\`\n`;
+      text += `*${escapeMd(p.title)}*\n`;
+      text += `  ID: \`${escapeMd(p.id)}\`\n`;
       text += `  Цена: ${formatPrice(p.price)} | Склад: ${stock}\n\n`;
     }
     text += "\nИспользуйте: `/addstock ID` для загрузки аккаунтов";
-    await ctx.reply(text, { parse_mode: "Markdown" });
+    // H6: list may exceed 4096 chars with many products — chunk it.
+    await safeReplyLong(ctx, text);
   });
 
   // /stock — остатки на складе
   bot.command("stock", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ Доступ запрещён.");
+      await safeReply(ctx, "⛔ Доступ запрещён.");
       return;
     }
     const products = await db.product.findMany({
@@ -418,24 +481,24 @@ async function setupBot() {
       const sold = await db.stockItem.count({ where: { productId: p.id, status: "sold" } });
       totalAvailable += available;
       const status = available === 0 ? "🔴" : available <= 3 ? "🟡" : "🟢";
-      text += `${status} *${p.title}*\n  В наличии: ${available} | Продано: ${sold}\n`;
+      text += `${status} *${escapeMd(p.title)}*\n  В наличии: ${available} | Продано: ${sold}\n`;
     }
     text += `\n*Всего на складе: ${totalAvailable}*`;
-    await ctx.reply(text, { parse_mode: "Markdown" });
+    await safeReplyLong(ctx, text);
   });
 
   // /smmstatus — статус SMM (для админа)
   bot.command("smmstatus", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) {
-      await ctx.reply("⛔ Доступ запрещён.");
+      await safeReply(ctx, "⛔ Доступ запрещён.");
       return;
     }
     const balance = await getBalance();
     let text = "📊 *SMM Статус (twiboost)*\n\n";
     if ("error" in balance) {
-      text += `❌ Ошибка: ${balance.error}`;
+      text += `❌ Ошибка: ${escapeMd(balance.error)}`;
     } else {
       text += `💰 Баланс: *${balance.balance} ${balance.currency}*\n`;
     }
@@ -450,15 +513,15 @@ async function setupBot() {
     for (const o of orders.slice(0, 5)) {
       const item = o.items[0];
       const smmMatch = item?.delivered?.match(/SMM Order: #(\d+)/);
-      const smmId = smmMatch ? parseInt(smmMatch[1]) : null;
+      const smmId = smmMatch ? parseInt(smmMatch[1], 10) : null;
       let status = "?";
       if (smmId) {
         const st = await getOrderStatus(smmId);
         if (!("error" in st)) status = st.status;
       }
-      text += `• ${o.number} → ${status}\n`;
+      text += `• ${escapeMd(o.number)} → ${escapeMd(status)}\n`;
     }
-    await ctx.reply(text, { parse_mode: "Markdown" });
+    await safeReplyLong(ctx, text);
   });
 
   // /legal — юридические документы
@@ -471,15 +534,16 @@ async function setupBot() {
       .url("💰 Цены и тарифы", domain + "/pricing").row()
       .url("📞 Контакты поддержки", domain + "/contacts").row()
       .url("⭐ Отзывы покупателей", domain + "/reviews");
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "📋 *Юридическая информация*\n\nВыберите документ для просмотра:",
-      { parse_mode: "Markdown", reply_markup: kb }
+      { reply_markup: kb }
     );
   });
 
   // /cancel — отмена режима загрузки
   bot.command("cancel", async (ctx) => {
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     let cancelled = false;
     if (pendingUploads.has(userId)) {
       pendingUploads.delete(userId);
@@ -489,8 +553,26 @@ async function setupBot() {
       pendingSessionUploads.delete(userId);
       cancelled = true;
     }
+    // H8: also clear any pending SMS orders for this user — release the SMS-provider
+    // number so the customer isn't billed for a leaked reservation.
+    for (const [orderId, so] of pendingSMSOrders) {
+      if (so.tgId === userId) {
+        try { await smsSetStatus(so.activationId, 8); } catch (e: any) {
+          console.error("[cancel] release SMS number failed:", e?.message || e);
+        }
+        pendingSMSOrders.delete(orderId);
+        cancelled = true;
+      }
+    }
+    // H8/C1: clear pending link requests (now keyed by orderId) for this user.
+    for (const [orderId, req] of pendingLinkRequests) {
+      if (req.tgId === userId) {
+        pendingLinkRequests.delete(orderId);
+        cancelled = true;
+      }
+    }
     if (cancelled) {
-      await ctx.reply("✅ Режим загрузки отменён.");
+      await safeReply(ctx, "✅ Режим загрузки отменён.");
     }
   });
 
@@ -567,6 +649,13 @@ async function setupBot() {
   // Cancel order
   bot.callbackQuery(/^cancel_order:(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
+    const userId = String(ctx.from?.id ?? "");
+    // C3: authorization — only the order's owner can cancel it (prevents abuse via forwarded messages).
+    const order = await db.order.findUnique({ where: { id: orderId }, select: { customerTg: true } });
+    if (!order || (order.customerTg && String(order.customerTg) !== userId)) {
+      await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
+      return;
+    }
     await cancelOrder(ctx, orderId);
     await ctx.answerCallbackQuery();
   });
@@ -574,6 +663,12 @@ async function setupBot() {
   // Noop (disabled buttons)
   bot.callbackQuery("noop", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Товара нет в наличии" });
+  });
+
+  // M1: dedicated "back to main menu" callback (replaces the misuse of "noop" in showReviews).
+  bot.callbackQuery("back_to_menu", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.reply("Главное меню:", { reply_markup: mainMenuKeyboard() });
   });
 
   // ---------- Правовая информация ----------
@@ -586,9 +681,10 @@ async function setupBot() {
       .url("💰 Цены и тарифы", domain + "/pricing").row()
       .url("📞 Контакты поддержки", domain + "/contacts").row()
       .url("⭐ Отзывы покупателей", domain + "/reviews");
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "📋 *Правовая информация*\n\nВыберите документ для просмотра:",
-      { parse_mode: "Markdown", reply_markup: kb }
+      { reply_markup: kb }
     );
     await ctx.answerCallbackQuery();
   });
@@ -596,19 +692,24 @@ async function setupBot() {
   // ---------- Смена виртуального номера ----------
   bot.callbackQuery(/^chgnum:(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
+    const userId = String(ctx.from?.id ?? "");
     const smsOrder = pendingSMSOrders.get(orderId);
     
-    if (!smsOrder) {
-      // No active SMS order to change — likely already completed/cancelled.
-      await ctx.answerCallbackQuery({ text: "⚠️ Активный номер не найден. Заказ уже завершён или отменён." });
+    // C3: authorization — only the original buyer can change the number on their order.
+    if (!smsOrder || smsOrder.tgId !== userId) {
+      await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
       return;
     }
     
     // Capture country BEFORE deleting from the map (default to 115/США if missing).
     const country = smsOrder.country ?? 115;
+    // H1: capture previous generation BEFORE deleting so the new entry gets gen+1.
+    const prevGen = smsOrder.gen ?? 0;
     
-    // Отменяем старый номер
-    try { await smsSetStatus(smsOrder.activationId, 8); } catch {}
+    // Отменяем старый номер. M8: log the cancel error instead of silently swallowing it.
+    try { await smsSetStatus(smsOrder.activationId, 8); } catch (e: any) {
+      console.error("[chgnum] cancel old number failed:", e?.message || e);
+    }
     pendingSMSOrders.delete(orderId);
     
     await ctx.answerCallbackQuery({ text: "🔄 Заказываю новый номер..." });
@@ -616,13 +717,16 @@ async function setupBot() {
     // Заказываем новый номер
     try {
       const result = await smsOrderNumber("tg", country);
+      // H1: increment generation counter so any in-flight pollSMS from the previous
+      // number aborts itself instead of leaking duplicate SMS codes to the customer.
       pendingSMSOrders.set(orderId, {
         activationId: result.id,
         phone: result.phone,
         attempts: 0,
-        chatId: ctx.chat.id,
-        tgId: String(ctx.from?.id),
+        chatId: ctx.chat?.id ?? 0,
+        tgId: String(ctx.from?.id ?? ""),
         country: country,
+        gen: prevGen + 1,
       });
       
       // Обновляем заказ
@@ -636,64 +740,102 @@ async function setupBot() {
         .row()
         .text("❌ Отменить", `cancelnum:${orderId}`);
       
-      await ctx.reply(
+      await safeReply(
+        ctx,
         `📱 *Новый номер заказан!*\n\n` +
         `📞 Номер: *${result.phone}*\n` +
         `⏳ Проверка SMS каждые 10 секунд...`,
-        { parse_mode: "Markdown", reply_markup: kb }
+        { reply_markup: kb }
       );
       
       // Запускаем polling
       pollSMS(orderId, ctx);
     } catch (e: any) {
-      await ctx.reply(`❌ Ошибка: ${e.message}`);
+      await safeReply(ctx, `❌ Ошибка: ${String(e?.message || e).slice(0, 200)}`);
     }
   });
 
   // ---------- Отмена виртуального номера ----------
   bot.callbackQuery(/^cancelnum:(.+)$/, async (ctx) => {
     const orderId = ctx.match[1];
+    const userId = String(ctx.from?.id ?? "");
     const smsOrder = pendingSMSOrders.get(orderId);
-    
-    if (smsOrder) {
-      // Пробуем отменить (status=8), если не выйдет — завершаем (status=6)
-      try {
-        const cancelResult = await smsSetStatus(smsOrder.activationId, 8);
-        console.log("[SMS] cancel result:", cancelResult);
-        if (cancelResult.includes("DENIED") || cancelResult.includes("ERROR")) {
-          // Если отмена не удалась — завершаем
-          await smsSetStatus(smsOrder.activationId, 6);
-          console.log("[SMS] fallback: completed instead of cancelled");
-        }
-      } catch (e: any) {
-        console.error("[SMS] cancel error:", e.message);
-        // Пробуем завершить
-        try { await smsSetStatus(smsOrder.activationId, 6); } catch {}
-      }
-      pendingSMSOrders.delete(orderId);
+
+    // C3: authorization — only the original buyer can cancel the number on their order.
+    if (!smsOrder || smsOrder.tgId !== userId) {
+      await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
+      return;
     }
+
+    // M7: track whether the SMS provider actually accepted our cancel/complete call,
+    // so we don't lie to the customer that "номер возвращён на сервис" when it wasn't.
+    let released = false;
+    // Пробуем отменить (status=8), если не выйдет — завершаем (status=6)
+    try {
+      const cancelResult = await smsSetStatus(smsOrder.activationId, 8);
+      console.log("[SMS] cancel result:", cancelResult);
+      if (cancelResult.includes("DENIED") || cancelResult.includes("ERROR")) {
+        // Если отмена не удалась — завершаем
+        const completeResult = await smsSetStatus(smsOrder.activationId, 6);
+        console.log("[SMS] fallback complete result:", completeResult);
+        if (!completeResult.includes("DENIED") && !completeResult.includes("ERROR")) {
+          released = true;
+        }
+      } else {
+        released = true;
+      }
+    } catch (e: any) {
+      console.error("[SMS] cancel error:", e?.message || e);
+      // Пробуем завершить
+      try {
+        const completeResult = await smsSetStatus(smsOrder.activationId, 6);
+        if (!completeResult.includes("DENIED") && !completeResult.includes("ERROR")) {
+          released = true;
+        }
+      } catch (e2: any) {
+        console.error("[SMS] fallback complete error:", e2?.message || e2);
+      }
+    }
+    pendingSMSOrders.delete(orderId);
     
     // Отменяем заказ
     await db.order.update({ where: { id: orderId }, data: { status: "cancelled" } });
     
     await ctx.answerCallbackQuery({ text: "❌ Отменено" });
-    await ctx.reply(
-      "✅ Заказ отменён. Номер возвращён на сервис.\n\n" +
-      "Если возникли вопросы — нажмите 💬 Поддержка.",
-      { parse_mode: "Markdown", reply_markup: mainMenuInline() }
-    );
+    if (released) {
+      await safeReply(
+        ctx,
+        "✅ Заказ отменён. Номер возвращён на сервис.\n\n" +
+        "Если возникли вопросы — нажмите 💬 Поддержка.",
+        { reply_markup: mainMenuInline() }
+      );
+    } else {
+      // M7: don't mislead — tell the customer the number may not have been released.
+      await safeReply(
+        ctx,
+        `⚠️ Не удалось автоматически вернуть номер. Обратитесь в поддержку с ID: ${smsOrder.activationId}`,
+        { reply_markup: mainMenuInline() }
+      );
+    }
   });
 
   // ---------- Получение кода входа для аккаунтов ----------
   bot.callbackQuery(/^getcode:(.+)$/, async (ctx) => {
     const itemId = ctx.match[1];
+    const userId = String(ctx.from?.id ?? "");
     try {
       // Находим orderItem и связанный StockItem
       const orderItem = await db.orderItem.findUnique({
         where: { id: itemId },
+        include: { order: { select: { customerTg: true } } },
       });
       if (!orderItem || !orderItem.delivered) {
         await ctx.answerCallbackQuery({ text: "Заказ не найден" });
+        return;
+      }
+      // C3: authorization — only the original buyer can request a login code for their account.
+      if (orderItem.order?.customerTg && String(orderItem.order.customerTg) !== userId) {
+        await ctx.answerCallbackQuery({ text: "Нет доступа к этому заказу" });
         return;
       }
       
@@ -722,17 +864,19 @@ async function setupBot() {
       
       if (result.code) {
         const time = result.receivedAt ? result.receivedAt.toLocaleTimeString("ru-RU") : "";
-        await ctx.reply(
+        await safeReply(
+          ctx,
           `📱 *Код входа получен!*\n\n` +
           `🔑 *Код:* \`${result.code}\`\n` +
           `⏰ Получен: ${time}\n\n` +
           `Введите этот код в Telegram для входа в аккаунт.\n\n` +
           `⚠️ Код действителен ограниченное время.\n` +
           `Если не подошёл — нажмите «📱 Получить код» ещё раз.`,
-          { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("📱 Получить код заново", `getcode:${itemId}`).row().text("💬 Поддержка", "support") }
+          { reply_markup: new InlineKeyboard().text("📱 Получить код заново", `getcode:${itemId}`).row().text("💬 Поддержка", "support") }
         );
       } else {
-        await ctx.reply(
+        await safeReply(
+          ctx,
           `⚠️ *Не удалось получить код*\n\n` +
           `Причина: ${result.error || "неизвестная"}\n\n` +
           `Возможные причины:\n` +
@@ -740,22 +884,32 @@ async function setupBot() {
           `• Session файл недействителен\n` +
           `• Нет доступа к аккаунту\n\n` +
           `Попробуйте ещё раз через 30 секунд.`,
-          { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("🔄 Попробовать снова", `getcode:${itemId}`).row().text("💬 Поддержка", "support") }
+          { reply_markup: new InlineKeyboard().text("🔄 Попробовать снова", `getcode:${itemId}`).row().text("💬 Поддержка", "support") }
         );
       }
     } catch (e: any) {
       console.error("getcode error:", e);
-      await ctx.answerCallbackQuery({ text: "Ошибка: " + e.message.slice(0, 100) });
+      // C4: e.message may not exist (non-Error throws); coerce to string safely.
+      await ctx.answerCallbackQuery({ text: "Ошибка: " + String(e?.message || e).slice(0, 100) });
     }
   });
 
   // ---------- Admin upload handler + SMM link handler ----------
   bot.on("message:text", async (ctx) => {
-    const userId = String(ctx.from?.id);
+    const userId = String(ctx.from?.id ?? "");
     
     // 1. Проверяем запрос ссылки для накрутки (для любого пользователя)
-    if (pendingLinkRequests.has(userId)) {
-      const req = pendingLinkRequests.get(userId)!;
+    // C1: pendingLinkRequests is now keyed by orderId — iterate to find this user's entry.
+    let foundOrderId: string | null = null;
+    let req: { orderId: string; productTitle: string; smmServiceKey: string; smmServiceId: string; quantity: number; tgId: string } | null = null;
+    for (const [orderId, r] of pendingLinkRequests) {
+      if (r.tgId === userId) {
+        foundOrderId = orderId;
+        req = r;
+        break;
+      }
+    }
+    if (req && foundOrderId) {
       const link = ctx.message.text.trim();
       
       if (link.startsWith("/") || link.length < 5) {
@@ -764,27 +918,37 @@ async function setupBot() {
       
       // Простая валидация ссылки
       if (!link.match(/^(https?:\/\/t\.me\/|@)/i)) {
-        await ctx.reply(
+        await safeReply(
+          ctx,
           "❌ Неверный формат ссылки.\n\n" +
           "Пришлите ссылку в формате:\n" +
           "• @username канала\n" +
           "• https://t.me/username\n" +
-          "• https://t.me/username/123 (для поста)",
-          { parse_mode: "Markdown" }
+          "• https://t.me/username/123 (для поста)"
         );
         return;
       }
       
-      pendingLinkRequests.delete(userId);
-      await ctx.reply("⏳ Создаю заказ на накрутку...");
+      // H4: re-fetch order status — if the user already cancelled (or paid-then-completed somehow),
+      // don't fire off a new SMM order on their behalf.
+      const fresh = await db.order.findUnique({ where: { id: req.orderId }, select: { status: true } });
+      if (!fresh || fresh.status !== "paid") {
+        await safeReply(ctx, "Заказ уже обработан или отменён.");
+        pendingLinkRequests.delete(foundOrderId);
+        return;
+      }
+      
+      pendingLinkRequests.delete(foundOrderId);
+      await safeReply(ctx, "⏳ Создаю заказ на накрутку...");
       
       // Заказываем через SMM API
       const result = await smmCreateOrder(req.smmServiceId, link, req.quantity);
       
       if ("error" in result) {
-        await ctx.reply(
-          `❌ *Ошибка создания заказа*\n\nПричина: ${result.error}\n\nОбратитесь в поддержку с номером заказа.`,
-          { parse_mode: "Markdown", reply_markup: mainMenuInline() }
+        await safeReply(
+          ctx,
+          `❌ *Ошибка создания заказа*\n\nПричина: ${escapeMd(result.error)}\n\nОбратитесь в поддержку с номером заказа.`,
+          { reply_markup: mainMenuInline() }
         );
       } else {
         // Обновляем заказ — записываем SMM order ID
@@ -797,31 +961,47 @@ async function setupBot() {
         // (Earlier the order was set to "paid" while waiting for the buyer's link.)
         await db.order.update({ where: { id: req.orderId }, data: { status: "completed" } });
         
-        await ctx.reply(
+        // H3: record the sale (product.salesCount + customer.totalSpent/ordersCount).
+        // deliverOrder() is NOT called on the boost path, so we have to bump these manually.
+        try {
+          // Fetch the order with items so recordSale can read customerId/total/firstItem.productId.
+          const saleOrder = await db.order.findUnique({
+            where: { id: req.orderId },
+            include: { items: true },
+          });
+          if (saleOrder) {
+            const firstItem = saleOrder.items[0];
+            if (firstItem) await recordSale(saleOrder, firstItem.productId, 1);
+          }
+        } catch (e: any) {
+          console.error("[boost] recordSale error:", e?.message || e);
+        }
+        
+        await safeReply(
+          ctx,
           `✅ *Заказ на накрутку запущен!*\n\n` +
           `📋 Номер заказа: *${req.orderId.slice(-8).toUpperCase()}*\n` +
           `🔢 SMM Order: #${result.orderId}\n` +
-          `📦 Услуга: ${req.productTitle}\n` +
+          `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
           `📊 Количество: ${req.quantity}\n` +
-          `🔗 Ссылка: ${link}\n\n` +
+          `🔗 Ссылка: ${escapeMd(link)}\n\n` +
           `⏰ Накрутка выполняется в фоне. Обычно занимает от 30 минут до 24 часов.\n\n` +
           `Проверить статус: /orders`,
-          { parse_mode: "Markdown", reply_markup: mainMenuInline() }
+          { reply_markup: mainMenuInline() }
         );
         
         // Уведомление админу
         const adminId = process.env.ADMIN_TG_ID?.trim();
         if (adminId) {
           try {
-            await ctx.api.sendMessage(adminId,
+            await safeSendMessage(ctx.api, adminId,
               `🔔 *Новый заказ на накрутку*\n\n` +
-              `👤 Клиент: ${ctx.from?.first_name || "Unknown"} (${userId})\n` +
+              `👤 Клиент: ${escapeMd(ctx.from?.first_name || "Unknown")} (${userId})\n` +
               `📋 Заказ: ${req.orderId.slice(-8).toUpperCase()}\n` +
               `🔢 SMM: #${result.orderId}\n` +
-              `📦 Услуга: ${req.productTitle}\n` +
+              `📦 Услуга: ${escapeMd(req.productTitle)}\n` +
               `📊 Кол-во: ${req.quantity}\n` +
-              `🔗 Ссылка: ${link}`,
-              { parse_mode: "Markdown" }
+              `🔗 Ссылка: ${escapeMd(link)}`
             );
           } catch (e) { console.error("Admin notify error:", e); }
         }
@@ -832,7 +1012,9 @@ async function setupBot() {
     // 2. Admin upload handler
     const adminId = process.env.ADMIN_TG_ID?.trim();
     if (!adminId || userId !== adminId || !pendingUploads.has(userId)) {
-      return; // не админ или не в режиме загрузки — пропускаем
+      // M2: unmatched text — show the main menu so the user isn't left in silence.
+      await ctx.reply("Используйте меню ниже 👇", { reply_markup: mainMenuKeyboard() });
+      return;
     }
     
     const upload = pendingUploads.get(userId)!;
@@ -874,9 +1056,9 @@ async function setupBot() {
       where: { productId: upload.productId, status: "available" },
     });
     
-    await ctx.reply(
-      `✅ Готово!\n\nДобавлено: ${added} аккаунтов\nТовар: ${upload.productTitle}\nВсего на складе: ${totalStock}\n\nИспользуйте /addstock ${upload.productId} для ещё одной загрузки`,
-      { parse_mode: "Markdown" }
+    await safeReply(
+      ctx,
+      `✅ Готово!\n\nДобавлено: ${added} аккаунтов\nТовар: ${escapeMd(upload.productTitle)}\nВсего на складе: ${totalStock}\n\nИспользуйте /addstock ${upload.productId} для ещё одной загрузки`
     );
   });
 
@@ -931,7 +1113,7 @@ async function setupBot() {
         return;
       }
       if (order.status === "completed") {
-        await ctx.reply(`✅ Этот заказ (${order.number}) уже оплачен и доставлен.`);
+        await safeReply(ctx, `✅ Этот заказ (${escapeMd(order.number)}) уже оплачен и доставлен.`);
         return;
       }
 
@@ -939,7 +1121,7 @@ async function setupBot() {
       const firstItem = order.items[0];
       if (!firstItem) {
         console.error("[tg-bot] successful_payment: order has no items", order.id);
-        await ctx.reply("⚠️ Заказ не содержит товаров. Обратитесь в поддержку.");
+        await safeReply(ctx, "⚠️ Заказ не содержит товаров. Обратитесь в поддержку.");
         return;
       }
       // Include category so we can detect product type robustly (slug keywords alone are fragile).
@@ -949,7 +1131,7 @@ async function setupBot() {
       });
       
       if (!product) {
-        await ctx.reply("⚠️ Товар не найден. Обратитесь в поддержку.");
+        await safeReply(ctx, "⚠️ Товар не найден. Обратитесь в поддержку.");
         return;
       }
 
@@ -971,7 +1153,7 @@ async function setupBot() {
         let country = 115;
         const countryMatch = product.longDesc?.match(/Страна: ID (\d+)/);
         if (countryMatch) {
-          const parsed = parseInt(countryMatch[1]);
+          const parsed = parseInt(countryMatch[1], 10);
           if (Number.isFinite(parsed)) country = parsed;
         } else {
           if (product.title.includes("Индонез")) country = 6;
@@ -985,13 +1167,15 @@ async function setupBot() {
         try {
           const result = await smsOrderNumber("tg", country);
           
+          // H1: initial gen = 0.
           pendingSMSOrders.set(order.id, {
             activationId: result.id,
             phone: result.phone,
             attempts: 0,
-            chatId: ctx.chat.id,
+            chatId: ctx.chat?.id ?? 0,
             tgId: tgId,
             country: country,
+            gen: 0,
           });
           
           await db.orderItem.updateMany({
@@ -999,7 +1183,9 @@ async function setupBot() {
             data: { delivered: `phone: ${result.phone}\nID: ${result.id}\n⏳ Ожидание SMS-кода...` },
           });
           
-          await db.order.update({ where: { id: order.id }, data: { status: "completed" } });
+          // H2: do NOT mark as completed yet — wait until the SMS code actually arrives
+          // (pollSMS sets "completed" when status.status === "ok"). Use "paid" in the meantime.
+          await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
           
           const kb = new InlineKeyboard()
             .text("🔄 Сменить номер", `chgnum:${order.id}`)
@@ -1015,7 +1201,7 @@ async function setupBot() {
             `2. Дождитесь SMS с кодом\n` +
             `3. Бот автоматически пришлёт код\n\n` +
             `_Если код не придёт — нажмите «🔄 Сменить номер»_`,
-            { parse_mode: "Markdown", reply_markup: kb }
+            { reply_markup: kb }
           );
           
           pollSMS(order.id, ctx);
@@ -1023,7 +1209,7 @@ async function setupBot() {
           console.error("[tg-bot] SMS order error:", e);
           await safeReply(
             ctx,
-            `⚠️ Не удалось заказать номер: ${e.message}\n\nОбратитесь в поддержку.`,
+            `⚠️ Не удалось заказать номер: ${String(e?.message || e).slice(0, 200)}\n\nОбратитесь в поддержку.`,
             { reply_markup: mainMenuInline() }
           );
         }
@@ -1042,12 +1228,14 @@ async function setupBot() {
         else if (product.title.includes("1000") && product.title.includes("реакц")) { smmServiceKey = "tg-react-1000"; quantity = 1000; }
         
         if (smmServiceKey && SMM_SERVICES[smmServiceKey]) {
-          pendingLinkRequests.set(tgId, {
+          // C1: key by order.id (not tgId) so a second boost order can't overwrite the first.
+          pendingLinkRequests.set(order.id, {
             orderId: order.id,
             productTitle: product.title,
             smmServiceKey,
             smmServiceId: SMM_SERVICES[smmServiceKey].serviceId,
             quantity,
+            tgId: tgId,
           });
           
           await db.orderItem.updateMany({
@@ -1062,8 +1250,8 @@ async function setupBot() {
           await safeReply(
             ctx,
             `🚀 *Заказ на накрутку оплачен!*\n\n` +
-            `Услуга: *${product.title}*\n` +
-            `Номер: *${order.number}*\n\n` +
+            `Услуга: *${escapeMd(product.title)}*\n` +
+            `Номер: *${escapeMd(order.number)}*\n\n` +
             `📌 *Пришлите ссылку на канал или пост:*\n` +
             `• Для подписчиков: @username или https://t.me/канал\n` +
             `• Для просмотров: https://t.me/канал/123\n` +
@@ -1073,7 +1261,7 @@ async function setupBot() {
         } else {
           await safeReply(
             ctx,
-            `⚠️ Услуга не найдена в SMM системе. Обратитесь в поддержку.\n\nЗаказ: ${order.number}`,
+            `⚠️ Услуга не найдена в SMM системе. Обратитесь в поддержку.\n\nЗаказ: ${escapeMd(order.number)}`,
             { reply_markup: mainMenuInline() }
           );
         }
@@ -1109,6 +1297,8 @@ async function setupBot() {
   // Each getOrderStatus call is wrapped in try/catch so one failure doesn't kill the loop.
   setInterval(async () => {
     try {
+      // H7: release stale (unpaid >30min) stock reservations so they don't pile up.
+      await releaseStaleReservations();
       if (!bot) return;
       // Ищем заказы со SMM Order в delivered, которые ещё не завершены
       const orders = await db.order.findMany({
@@ -1121,19 +1311,22 @@ async function setupBot() {
       for (const o of orders) {
         for (const it of o.items) {
           if (!it.delivered || !it.delivered.includes("SMM Order")) continue;
-          if (it.delivered.includes("✅ Накрутка выполнена")) continue; // уже завершён
+          // C2: skip both Completed AND Partial variants — the previous check only matched
+          // the "✅ Накрутка выполнена" label, so Partial orders (label "⚠️ Накрутка выполнена
+          // частично") were re-appended every 5 min → customer spam + unbounded DB growth.
+          if (it.delivered.includes("Накрутка выполнена")) continue;
           if (it.delivered.includes("Накрутка отменена")) continue;
           
           const smmMatch = it.delivered.match(/SMM Order: #(\d+)/);
           if (!smmMatch) continue;
-          const smmId = parseInt(smmMatch[1]);
+          const smmId = parseInt(smmMatch[1], 10);
           if (!Number.isFinite(smmId)) continue;
           
           let status;
           try {
             status = await getOrderStatus(smmId);
           } catch (e: any) {
-            console.error(`[smm-poll] getOrderStatus error for SMM #${smmId}:`, e.message);
+            console.error(`[smm-poll] getOrderStatus error for SMM #${smmId}:`, e?.message || e);
             continue;
           }
           if (!status || "error" in status) continue;
@@ -1149,9 +1342,8 @@ async function setupBot() {
             });
             if (o.customerTg) {
               try {
-                await bot!.api.sendMessage(o.customerTg,
-                  `✅ *Накрутка выполнена!*\n\nЗаказ ${o.number}\nSMM #${smmId}\nСтатус: ${s}\n\nСпасибо за покупку! 🙏\nОставьте отзыв: /reviews`,
-                  { parse_mode: "Markdown" }
+                await safeSendMessage(bot!.api, o.customerTg,
+                  `✅ *Накрутка выполнена!*\n\nЗаказ ${escapeMd(o.number)}\nSMM #${smmId}\nСтатус: ${s}\n\nСпасибо за покупку! 🙏\nОставьте отзыв: /reviews`
                 );
               } catch (e) { console.error("[smm-poll] Notify customer error:", e); }
             }
@@ -1162,9 +1354,8 @@ async function setupBot() {
             });
             if (o.customerTg) {
               try {
-                await bot!.api.sendMessage(o.customerTg,
-                  `❌ *Накрутка отменена*\n\nЗаказ ${o.number}\nSMM #${smmId}\n\nОбратитесь в поддержку для возврата.`,
-                  { parse_mode: "Markdown" }
+                await safeSendMessage(bot!.api, o.customerTg,
+                  `❌ *Накрутка отменена*\n\nЗаказ ${escapeMd(o.number)}\nSMM #${smmId}\n\nОбратитесь в поддержку для возврата.`
                 );
               } catch (e) { console.error("[smm-poll] Notify customer error:", e); }
             }
@@ -1186,8 +1377,11 @@ async function setupBot() {
       },
     });
   } catch (e) {
-    botRunning = false;
     console.error("[tg-bot] bot.start() failed:", e);
+  } finally {
+    // M10: ensure botRunning flips back to false even if start() throws/rejects,
+    // so the health endpoint stops reporting "running" for a dead bot.
+    botRunning = false;
   }
 }
 
@@ -1195,12 +1389,17 @@ async function setupBot() {
 async function pollSMS(orderId: string, ctx: any) {
   const smsOrder = pendingSMSOrders.get(orderId);
   if (!smsOrder) return;
+  // H1: capture this poll's generation. If chgnum fires while we're sleeping, the entry
+  // gets a new gen — we'll detect the mismatch on the next iteration and abort so we
+  // don't deliver a stale SMS code (or a duplicate after the new number arrives).
+  const myGen = smsOrder.gen;
   
   const maxAttempts = 60; // 60 попыток × 10 сек = 10 минут
   
   for (let i = 0; i < maxAttempts; i++) {
     const current = pendingSMSOrders.get(orderId);
-    if (!current) return; // заказ отменён или сменён
+    // H1: abort if the entry was deleted (cancel) or bumped to a new gen (chgnum).
+    if (!current || current.gen !== myGen) return;
     
     try {
       const status = await smsGetStatus(current.activationId);
@@ -1220,33 +1419,55 @@ async function pollSMS(orderId: string, ctx: any) {
           data: { delivered: `📱 Номер: ${phone}\n🔑 Код: ${status.code}` },
         });
         
+        // H2: now that the SMS code has actually arrived, mark the order completed.
+        // (Earlier the order was set to "paid" by the successful_payment handler.)
+        try {
+          await db.order.update({ where: { id: orderId }, data: { status: "completed" } });
+        } catch (e: any) {
+          console.error("[pollSMS] mark completed error:", e?.message || e);
+        }
+        
+        // H3: record the sale (product.salesCount + customer.totalSpent/ordersCount).
+        try {
+          const saleOrder = await db.order.findUnique({
+            where: { id: orderId },
+            include: { items: true },
+          });
+          if (saleOrder) {
+            const firstItem = saleOrder.items[0];
+            if (firstItem) await recordSale(saleOrder, firstItem.productId, 1);
+          }
+        } catch (e: any) {
+          console.error("[pollSMS] recordSale error:", e?.message || e);
+        }
+        
         // Отправляем код покупателю
         const kb = new InlineKeyboard()
           .text("💬 Поддержка", "support")
           .row()
           .text("⭐ Оставить отзыв", "reviews");
         
-        await ctx.api.sendMessage(current.chatId,
+        await safeSendMessage(ctx.api, current.chatId,
           `✅ *SMS-код получен!*\n\n` +
           `📱 Номер: ${phone}\n` +
           `🔑 *Код: ${status.code}*\n\n` +
           `Введите этот код в Telegram для входа.\n\n` +
           `_Код действителен ограниченное время._`,
-          { parse_mode: "Markdown", reply_markup: kb }
+          { reply_markup: kb }
         );
         return;
       }
       
       if (status.status === "cancel") {
         pendingSMSOrders.delete(orderId);
-        await ctx.api.sendMessage(current.chatId,
+        await safeSendMessage(ctx.api, current.chatId,
           "❌ Номер был отменён. Используйте «🔄 Сменить номер» для заказа нового.",
           { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
         );
         return;
       }
     } catch (e: any) {
-      console.error("[tg-bot] SMS poll error:", e);
+      console.error("[tg-bot] SMS poll error:", e?.message || e);
     }
     
     // Ждём 10 секунд
@@ -1255,16 +1476,18 @@ async function pollSMS(orderId: string, ctx: any) {
   
   // Таймаут — код не пришёл за 10 минут
   const current = pendingSMSOrders.get(orderId);
-  if (current) {
+  if (current && current.gen === myGen) {
     pendingSMSOrders.delete(orderId);
     // Отменяем номер на сервисе
-    try { await smsSetStatus(current.activationId, 8); } catch {}
+    try { await smsSetStatus(current.activationId, 8); } catch (e: any) {
+      console.error("[pollSMS] timeout cancel error:", e?.message || e);
+    }
     
-    await ctx.api.sendMessage(current.chatId,
+    await safeSendMessage(ctx.api, current.chatId,
       "⏰ *Время ожидания истекло*\n\n" +
       "SMS-код не был получен за 10 минут.\n" +
       "Нажмите «🔄 Сменить номер» для заказа нового номера.",
-      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+      { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
     );
   }
 }
@@ -1293,7 +1516,7 @@ async function showAdminMenu(ctx: any) {
     `2. Покупатель получит данные + кнопку «📱 Получить код»\n` +
     `3. Код придёт автоматически из аккаунта`;
   
-  await ctx.reply(text, { parse_mode: "Markdown" });
+  await safeReply(ctx, text);
 }
 
 // ---------- Catalog flow ----------
@@ -1304,7 +1527,8 @@ async function showCategories(ctx: any) {
   });
 
   if (categories.length === 0) {
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "Категории пока не добавлены. Загляните позже 🌱",
       { reply_markup: mainMenuKeyboard() }
     );
@@ -1313,16 +1537,19 @@ async function showCategories(ctx: any) {
 
   const kb = new InlineKeyboard();
   for (const c of categories) {
-    kb.text(`${c.icon || "📁"} ${c.name} (${c.products.length})`, `cat:${c.id}`).row();
+    kb.text(`${c.icon || "📁"} ${escapeMd(c.name)} (${c.products.length})`, `cat:${c.id}`).row();
   }
 
-  await ctx.reply(
+  await safeReply(
+    ctx,
     "🛍 *Каталог*\nВыберите категорию:",
-    { parse_mode: "Markdown", reply_markup: kb }
+    { reply_markup: kb }
   );
 }
 
 async function showProductsInCategory(ctx: any, categoryId: string) {
+  // H7: release stale reservations up-front so stock counts shown here are accurate.
+  await releaseStaleReservations();
   const products = await db.product.findMany({
     where: { categoryId, active: true },
     orderBy: { salesCount: "desc" },
@@ -1330,7 +1557,7 @@ async function showProductsInCategory(ctx: any, categoryId: string) {
 
   if (products.length === 0) {
     const kb = new InlineKeyboard().text("⬅️ Назад", "back_to_cats");
-    await ctx.reply("В этой категории пока нет товаров.", { reply_markup: kb });
+    await safeReply(ctx, "В этой категории пока нет товаров.", { reply_markup: kb });
     return;
   }
 
@@ -1346,8 +1573,8 @@ async function showProductsInCategory(ctx: any, categoryId: string) {
       : "";
 
     const text =
-      `*${p.title}*\n` +
-      `${p.description}\n\n` +
+      `*${escapeMd(p.title)}*\n` +
+      `${escapeMd(p.description)}\n\n` +
       `💰 ${priceLine}${oldPriceLine}\n` +
       `${ratingLine} · 🛒 ${p.salesCount} продаж\n` +
       `📦 ${stockLabel}`;
@@ -1359,7 +1586,7 @@ async function showProductsInCategory(ctx: any, categoryId: string) {
       kb.text("🚫 Нет в наличии", "noop");
     }
     kb.row().text("⬅️ К категориям", "back_to_cats");
-    await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+    await safeReply(ctx, text, { reply_markup: kb });
   }
 }
 
@@ -1371,31 +1598,32 @@ async function showStars(ctx: any) {
   });
 
   if (products.length === 0) {
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "⭐ Звёзды пока не добавлены в каталог. Загляните позже!",
       { reply_markup: mainMenuKeyboard() }
     );
     return;
   }
 
-  await ctx.reply("⭐ *Покупка Telegram Звёзд*\nВыберите пакет:", {
-    parse_mode: "Markdown",
-  });
+  await safeReply(ctx, "⭐ *Покупка Telegram Звёзд*\nВыберите пакет:");
 
   for (const p of products) {
     const stock = await db.stockItem.count({
       where: { productId: p.id, status: "available" },
     });
-    if (stock <= 0) continue;
+    // M11: stars products are delivered via Telegram Stars payment, not from StockItem —
+    // don't hide them just because StockItem count is 0.
+    if (p.type !== "stars" && stock <= 0) continue;
     const ratingLine = p.rating > 0 ? `${stars(p.rating)} ${p.rating.toFixed(1)}` : "";
     const text =
-      `*${p.title}*\n` +
-      `${p.description}\n` +
+      `*${escapeMd(p.title)}*\n` +
+      `${escapeMd(p.description)}\n` +
       `💰 ${formatPrice(p.price, p.currency)}` +
       (ratingLine ? `\n${ratingLine}` : "") +
       `\n📦 В наличии: ${stock}`;
     const kb = new InlineKeyboard().text("🛒 Купить", `buy:${p.id}`);
-    await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+    await safeReply(ctx, text, { reply_markup: kb });
   }
 }
 
@@ -1403,7 +1631,7 @@ async function showStars(ctx: any) {
 async function showOrders(ctx: any) {
   const tgId = String(ctx.from?.id ?? "");
   if (!tgId) {
-    await ctx.reply("Не удалось определить ваш Telegram ID.", {
+    await safeReply(ctx, "Не удалось определить ваш Telegram ID.", {
       reply_markup: mainMenuKeyboard(),
     });
     return;
@@ -1417,23 +1645,22 @@ async function showOrders(ctx: any) {
   });
 
   if (orders.length === 0) {
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "📦 У вас пока нет заказов.\nОткройте каталог, чтобы сделать первый заказ 🛍",
       { reply_markup: mainMenuKeyboard() }
     );
     return;
   }
 
-  await ctx.reply("📦 *Ваши последние заказы:*", {
-    parse_mode: "Markdown",
-  });
+  await safeReply(ctx, "📦 *Ваши последние заказы:*");
 
   for (const o of orders) {
     const itemsLine = o.items
-      .map((i) => `• ${i.title} ×${i.qty} — ${formatPrice(i.price * i.qty, o.currency)}`)
+      .map((i: any) => `• ${escapeMd(i.title)} ×${i.qty} — ${formatPrice(i.price * i.qty, o.currency)}`)
       .join("\n");
     const text =
-      `*${o.number}*\n` +
+      `*${escapeMd(o.number)}*\n` +
       `${orderStatusLabel(o.status)}\n` +
       `💳 Сумма: ${formatPrice(o.total, o.currency)}\n` +
       `📅 ${formatDate(o.createdAt)}\n` +
@@ -1445,7 +1672,8 @@ async function showOrders(ctx: any) {
       // Users pay via the Stars invoice sent at order creation. If they lost it, they cancel and re-order.
       kb.text("❌ Отменить", `cancel_order:${o.id}`);
     }
-    await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+    // H6: in case an order has many items and the text overruns 4096 chars, chunk it.
+    await safeReplyLong(ctx, text, { reply_markup: kb });
   }
 }
 
@@ -1456,10 +1684,9 @@ async function showSupport(ctx: any) {
   const text =
     `💬 *Поддержка*\n\n` +
     `Если у вас возникли вопросы по заказу, оплате или доставке — пишите:\n` +
-    `${contact}\n\n` +
+    `${escapeMd(contact)}\n\n` +
     `Мы отвечаем с 9:00 до 23:00 (МСК).`;
-  await ctx.reply(text, {
-    parse_mode: "Markdown",
+  await safeReply(ctx, text, {
     reply_markup: mainMenuInline(),
   });
 }
@@ -1494,10 +1721,10 @@ async function showReviews(ctx: any) {
     if (reviews.length > 0) {
       text += `*Последние отзывы:*\n\n`;
       for (const r of reviews) {
-        const stars = "⭐".repeat(r.rating);
-        text += `${stars} *${r.author}*\n`;
-        text += `${r.text.slice(0, 100)}${r.text.length > 100 ? "..." : ""}\n`;
-        if (r.product) text += `📦 _${r.product.title}_\n`;
+        const starsStr = "⭐".repeat(r.rating);
+        text += `${starsStr} *${escapeMd(r.author)}*\n`;
+        text += `${escapeMd(r.text.slice(0, 100))}${r.text.length > 100 ? "..." : ""}\n`;
+        if (r.product) text += `📦 _${escapeMd(r.product.title)}_\n`;
         text += `\n`;
       }
     } else {
@@ -1509,12 +1736,14 @@ async function showReviews(ctx: any) {
     const kb = new InlineKeyboard()
       .url("🌐 Открыть все отзывы", reviewsUrl)
       .row()
-      .text("⬅️ В меню", "noop");
+      // M1: dedicated back_to_menu callback (was "noop" which actually meant "товара нет в наличии").
+      .text("⬅️ В меню", "back_to_menu");
     
-    await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+    // H6: a long batch of reviews could push the message past 4096 chars — chunk it.
+    await safeReplyLong(ctx, text, { reply_markup: kb });
   } catch (e: any) {
     console.error("[tg-bot] showReviews error:", e);
-    await ctx.reply("⚠️ Не удалось загрузить отзывы. Попробуйте позже.");
+    await safeReply(ctx, "⚠️ Не удалось загрузить отзывы. Попробуйте позже.");
   }
 }
 
@@ -1523,14 +1752,15 @@ async function openStore(ctx: any) {
   const s = await getSettings();
   const url = WEBAPP_URL || s.miniAppUrl || "";
   if (!url) {
-    await ctx.reply(
+    await safeReply(
+      ctx,
       "🌐 Веб-приложение магазина пока не настроено.",
       { reply_markup: mainMenuKeyboard() }
     );
     return;
   }
   const kb = new InlineKeyboard().webApp("🛒 Открыть магазин", url);
-  await ctx.reply("🌐 Нажмите кнопку ниже, чтобы открыть магазин:", {
+  await safeReply(ctx, "🌐 Нажмите кнопку ниже, чтобы открыть магазин:", {
     reply_markup: kb,
   });
 }
@@ -1576,26 +1806,38 @@ async function createOrderFromProduct(ctx: any, productId: string) {
     create: { tgId, username, firstName, lastName },
   });
 
-  const order = await db.order.create({
-    data: {
-      number: genOrderNumber(),
-      customerId: customer.id,
-      customerTg: tgId,
-      customerName,
-      status: "pending",
-      total: product.price,
-      payMethod: "stars",
-      items: {
-        create: {
-          productId: product.id,
-          title: product.title,
-          price: product.price,
-          qty: 1,
-        },
+  // L1: retry on P2002 (unique-constraint collision on `number`) — genOrderNumber is
+  // 8 random chars so collisions are rare but possible; regenerate up to 3 times.
+  const orderData = {
+    customerId: customer.id,
+    customerTg: tgId,
+    customerName,
+    status: "pending",
+    total: product.price,
+    payMethod: "stars",
+    items: {
+      create: {
+        productId: product.id,
+        title: product.title,
+        price: product.price,
+        qty: 1,
       },
     },
-    include: { items: true },
-  });
+  };
+  let order: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      order = await db.order.create({
+        data: { ...orderData, number: genOrderNumber() },
+        include: { items: true },
+      });
+      break;
+    } catch (e: any) {
+      if (e?.code === "P2002" && attempt < 2) continue;
+      throw e;
+    }
+  }
+  if (!order) throw new Error("Не удалось создать заказ после 3 попыток");
 
   // Reserve stock / mark services
   for (const it of order.items) {
@@ -1637,7 +1879,7 @@ async function createOrderFromProduct(ctx: any, productId: string) {
         where: { reservedOrderId: order.id },
         data: { status: "available", reservedOrderId: null },
       });
-      await ctx.reply(`⚠️ ${e.message}\n\nЗаказ ${order.number} отменён.`, { reply_markup: mainMenuInline() });
+      await safeReply(ctx, `⚠️ ${String(e?.message || e).slice(0, 200)}\n\nЗаказ ${order.number} отменён.`, { reply_markup: mainMenuInline() });
       return;
     }
   }
@@ -1661,7 +1903,7 @@ async function createOrderFromProduct(ctx: any, productId: string) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: ctx.chat.id,
+        chat_id: ctx.chat?.id ?? 0,
         title: label,
         description: invoiceDesc,
         payload: invoicePayload,
@@ -1673,22 +1915,65 @@ async function createOrderFromProduct(ctx: any, productId: string) {
     if (!tgData.ok) {
       throw new Error(`Telegram API: ${tgData.description || tgData.error_code}`);
     }
-    await ctx.reply(
-      `🧾 Заказ *${order.number}* создан.\n` +
+    await safeReply(
+      ctx,
+      `🧾 Заказ *${escapeMd(order.number)}* создан.\n` +
       `Сумма: ${formatPrice(order.total, order.currency)} = *${starsAmount} ⭐*\n\n` +
       `Оплатите инвойс выше ⭐ — товар придёт автоматически.`,
-      { parse_mode: "Markdown", reply_markup: mainMenuInline() }
+      { reply_markup: mainMenuInline() }
     );
   } catch (e: any) {
     console.error("[tg-bot] sendInvoice error:", e);
-    await ctx.reply(
-      `⚠️ Не удалось создать счёт для оплаты. Попробуйте позже или напишите в поддержку.\n\nЗаказ: ${order.number}`,
+    await safeReply(
+      ctx,
+      `⚠️ Не удалось создать счёт для оплаты. Попробуйте позже или напишите в поддержку.\n\nЗаказ: ${escapeMd(order.number)}`,
       { reply_markup: mainMenuInline() }
     );
   }
 }
 
 // ---------- Delivery core (used by successful_payment) ----------
+
+// H3: recordSale — increments product.salesCount + customer.totalSpent/ordersCount.
+// Used on the virtual-number and boost paths, where deliverOrder() is NOT called and
+// therefore these counters were never updated (under-counting sales & spend).
+async function recordSale(order: any, productId: string, qty: number) {
+  try {
+    await db.product.update({ where: { id: productId }, data: { salesCount: { increment: qty } } });
+    if (order.customerId) {
+      await db.customer.update({
+        where: { id: order.customerId },
+        data: { totalSpent: { increment: order.total }, ordersCount: { increment: 1 } },
+      });
+    }
+  } catch (e: any) {
+    console.error("[recordSale] error:", e?.message || e);
+  }
+}
+
+// H7: releaseStaleReservations — cancel pending orders older than 30 min so their
+// reserved StockItems are returned to "available" for other buyers. Called from the
+// SMM poll setInterval (every 5 min) and at startup.
+async function releaseStaleReservations() {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000); // 30 min
+    const stale = await db.order.findMany({
+      where: { status: "pending", createdAt: { lt: cutoff } },
+      select: { id: true },
+    });
+    for (const o of stale) {
+      await db.stockItem.updateMany({
+        where: { reservedOrderId: o.id, status: "reserved" },
+        data: { status: "available", reservedOrderId: null },
+      });
+      await db.order.update({ where: { id: o.id }, data: { status: "cancelled", note: "auto-cancelled: unpaid timeout" } });
+    }
+    if (stale.length > 0) console.log(`[cleanup] released ${stale.length} stale reservations`);
+  } catch (e: any) {
+    console.error("[cleanup] releaseStaleReservations error:", e?.message || e);
+  }
+}
+
 async function deliverOrder(order: any) {
   const deliveredLines: string[] = [];
   for (const it of order.items) {
@@ -1813,7 +2098,7 @@ async function sendDeliveryMessage(ctx: any, order: any) {
   }
   
   const summary =
-    `🎉 Заказ *${order.number}* оплачен!\n\n` +
+    `🎉 Заказ *${escapeMd(order.number)}* оплачен!\n\n` +
     `Спасибо за покупку 🙏\n` +
     `Вот ваш товар:\n\n` +
     lines.join("\n\n");
@@ -1827,7 +2112,7 @@ async function sendDeliveryMessage(ctx: any, order: any) {
     await safeReply(ctx, summary, { reply_markup: kb });
   } else {
     await safeReply(ctx, summary);
-    await ctx.reply("Если есть вопросы — нажмите 💬 Поддержка.", {
+    await safeReply(ctx, "Если есть вопросы — нажмите 💬 Поддержка.", {
       reply_markup: mainMenuInline(),
     });
   }
@@ -1840,11 +2125,11 @@ async function cancelOrder(ctx: any, orderId: string) {
     include: { items: true },
   });
   if (!order) {
-    await ctx.reply("Заказ не найден.");
+    await safeReply(ctx, "Заказ не найден.");
     return;
   }
   if (order.status === "completed") {
-    await ctx.reply("Нельзя отменить уже выполненный заказ.");
+    await safeReply(ctx, "Нельзя отменить уже выполненный заказ.");
     return;
   }
 
@@ -1860,7 +2145,7 @@ async function cancelOrder(ctx: any, orderId: string) {
     data: { status: "cancelled" },
   });
 
-  await ctx.reply(`Заказ ${order.number} отменён. Запас возвращён на склад.`, {
+  await safeReply(ctx, `Заказ ${escapeMd(order.number)} отменён. Запас возвращён на склад.`, {
     reply_markup: mainMenuInline(),
   });
 }
@@ -1872,8 +2157,9 @@ async function shutdown(signal: string) {
   await db.$disconnect();
   process.exit(0);
 }
-process.on("SIGINT", () => void shutdown("SIGINT"));
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
+// H9: don't fire-and-forget shutdown — catch any rejection so it gets logged.
+process.on("SIGINT", () => { shutdown("SIGINT").catch((e) => console.error("[shutdown] error:", e)); });
+process.on("SIGTERM", () => { shutdown("SIGTERM").catch((e) => console.error("[shutdown] error:", e)); });
 
 // ---------- Boot ----------
 (async () => {
@@ -1881,6 +2167,8 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
   console.log(`[tg-bot] PORT=${PORT}`);
   console.log(`[tg-bot] BOT_TOKEN=${BOT_TOKEN ? "set" : "(empty)"}`);
   console.log(`[tg-bot] WEBAPP_URL=${WEBAPP_URL || "(empty)"}`);
+  // H7: clean up stale stock reservations left over from a previous run.
+  await releaseStaleReservations();
   console.log("[tg-bot] About to call setupBot...");
   await setupBot();
   console.log("[tg-bot] setupBot completed, botRunning:", botRunning);
