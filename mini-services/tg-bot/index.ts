@@ -1220,23 +1220,85 @@ async function setupBot() {
 
       if (isVirtualNumber) {
         // === ВИРТУАЛЬНЫЙ НОМЕР ===
-        let country = 115;
+        // Определяем предпочитаемую страну по товару, но при NO_NUMBERS fallback на другие.
+        const COUNTRY_FALLBACK_CHAIN = [6, 16, 115, 34, 93]; // Индонезия, Великобритания, США, Канада, Португалия
+        let preferredCountry = 115;
         const countryMatch = product.longDesc?.match(/Страна: ID (\d+)/);
         if (countryMatch) {
           const parsed = parseInt(countryMatch[1], 10);
-          if (Number.isFinite(parsed)) country = parsed;
+          if (Number.isFinite(parsed)) preferredCountry = parsed;
         } else {
-          if (product.title.includes("Индонез")) country = 6;
-          else if (product.title.includes("Канад")) country = 34;
-          else if (product.title.includes("США") || product.title.includes("USA")) country = 115;
-          else if (product.title.includes("Великобритан") || product.title.includes("UK")) country = 16;
-          else if (product.title.includes("Португал")) country = 93;
-          //RU/UA не поддерживаются smsfast.vip для Telegram — fallback на США(115)
+          if (product.title.includes("Индонез")) preferredCountry = 6;
+          else if (product.title.includes("Канад")) preferredCountry = 34;
+          else if (product.title.includes("США") || product.title.includes("USA")) preferredCountry = 115;
+          else if (product.title.includes("Великобритан") || product.title.includes("UK")) preferredCountry = 16;
+          else if (product.title.includes("Португал")) preferredCountry = 93;
+        }
+        // Fallback chain: начинаем с preferred, потом остальные
+        const tryCountries = [preferredCountry, ...COUNTRY_FALLBACK_CHAIN.filter(c => c !== preferredCountry)];
+        
+        let result: { id: number; phone: string } | null = null;
+        let lastError = "";
+        let usedCountry = preferredCountry;
+        for (const c of tryCountries) {
+          try {
+            console.log(`[SMS] trying country=${c} for order ${order.id}`);
+            result = await smsOrderNumber("tg", c);
+            usedCountry = c;
+            break;
+          } catch (e: any) {
+            const msg = String(e?.message || e);
+            lastError = msg;
+            console.log(`[SMS] country=${c} failed: ${msg}`);
+            if (msg.includes("NO_NUMBERS") || msg.includes("Нет доступных номеров")) continue;
+            // NO_BALANCE или другая ошибка — нет смысла пробовать дальше
+            break;
+          }
+        }
+        
+        if (!result) {
+          // Не удалось заказать номер ни из одной страны → refund Stars автоматически
+          console.error("[tg-bot] SMS order failed for all countries. Last error:", lastError);
+          // Уведомить админа
+          const adminId = process.env.ADMIN_TG_ID?.trim();
+          if (adminId && bot) {
+            try {
+              await bot.api.sendMessage(adminId,
+                `🚨 *Нет номеров на smsfast.vip!*\n\n` +
+                `Заказ: ${order.number}\n` +
+                `Пользователь: ${tgId}\n` +
+                `Последняя ошибка: ${lastError.slice(0, 150)}\n\n` +
+                `Проверьте наличие номеров на https://smsfast.vip или пополните баланс.`,
+                { parse_mode: "Markdown" });
+            } catch {}
+          }
+          // Авто-refund Stars
+          if (order.starPaymentChargeId && tgId) {
+            try {
+              await bot!.api.refundStarPayment(Number(tgId), order.starPaymentChargeId);
+              await db.order.update({ where: { id: order.id }, data: { status: "refunded" } });
+              await safeReply(ctx,
+                `⚠️ Не удалось заказать номер (нет доступных на сервисе).\n\n` +
+                `✅ Stars автоматически возвращены на ваш аккаунт.\n` +
+                `Попробуйте позже или выберите другую страну.`,
+                { reply_markup: mainMenuInline() });
+            } catch (refundErr: any) {
+              console.error("[SMS] refund failed:", refundErr?.message || refundErr);
+              await db.order.update({ where: { id: order.id }, data: { status: "cancelled", note: "no numbers + refund failed" } });
+              await safeReply(ctx,
+                `⚠️ Не удалось заказать номер. Обратитесь в поддержку с номером заказа ${order.number} для возврата Stars.`,
+                { reply_markup: mainMenuInline() });
+            }
+          } else {
+            await db.order.update({ where: { id: order.id }, data: { status: "cancelled", note: "no numbers available" } });
+            await safeReply(ctx,
+              `⚠️ Не удалось заказать номер. Обратитесь в поддержку с номером заказа ${order.number}.`,
+              { reply_markup: mainMenuInline() });
+          }
+          return;
         }
         
         try {
-          const result = await smsOrderNumber("tg", country);
-          
           // H1: initial gen = 0.
           pendingSMSOrders.set(order.id, {
             activationId: result.id,
@@ -1244,7 +1306,7 @@ async function setupBot() {
             attempts: 0,
             chatId: ctx.chat?.id ?? 0,
             tgId: tgId,
-            country: country,
+            country: usedCountry,
             gen: 0,
           });
           
@@ -1254,7 +1316,6 @@ async function setupBot() {
           });
           
           // H2: do NOT mark as completed yet — wait until the SMS code actually arrives
-          // (pollSMS sets "completed" when status.status === "ok"). Use "paid" in the meantime.
           await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
           
           const kb = new InlineKeyboard()
@@ -1270,7 +1331,7 @@ async function setupBot() {
             `1. Введите этот номер в Telegram\n` +
             `2. Дождитесь SMS с кодом\n` +
             `3. Бот автоматически пришлёт код\n\n` +
-            `_Если код не придёт — нажмите «🔄 Сменить номер»_`,
+            `_Если код не придёт за 10 минут — нажмите «🔄 Сменить номер»_`,
             { reply_markup: kb }
           );
           
@@ -1467,7 +1528,7 @@ async function pollSMS(orderId: string, ctx: any) {
   // don't deliver a stale SMS code (or a duplicate after the new number arrives).
   const myGen = smsOrder.gen;
   
-  const maxAttempts = 60; // 60 попыток × 10 сек = 10 минут
+  const maxAttempts = 90; // 90 попыток × 10 сек = 15 минут (smsfast.vip отменяет через ~20 мин)
   
   for (let i = 0; i < maxAttempts; i++) {
     const current = pendingSMSOrders.get(orderId);
@@ -1533,10 +1594,33 @@ async function pollSMS(orderId: string, ctx: any) {
       
       if (status.status === "cancel") {
         pendingSMSOrders.delete(orderId);
-        await safeSendMessage(ctx.api, current.chatId,
-          "❌ Номер был отменён. Используйте «🔄 Сменить номер» для заказа нового.",
-          { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-        );
+        // smsfast.vip отменил номер (например, не дождались SMS) → авто-refund Stars
+        let refunded = false;
+        try {
+          const ord = await db.order.findUnique({ where: { id: orderId }, select: { number: true, starPaymentChargeId: true, customerTg: true } });
+          if (ord?.starPaymentChargeId && ord.customerTg) {
+            try {
+              await bot!.api.refundStarPayment(Number(ord.customerTg), ord.starPaymentChargeId);
+              await db.order.update({ where: { id: orderId }, data: { status: "refunded" } });
+              refunded = true;
+            } catch (re: any) {
+              console.error("[pollSMS] cancel-refund failed:", re?.message || re);
+            }
+          }
+        } catch (e: any) {
+          console.error("[pollSMS] cancel-refund lookup failed:", e?.message || e);
+        }
+        if (refunded) {
+          await safeSendMessage(ctx.api, current.chatId,
+            "❌ Номер был отменён сервисом (код не пришёл вовремя).\n\n✅ Stars автоматически возвращены. Попробуйте другую страну.",
+            { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+          );
+        } else {
+          await safeSendMessage(ctx.api, current.chatId,
+            "❌ Номер был отменён. Используйте «🔄 Сменить номер» для заказа нового.",
+            { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+          );
+        }
         return;
       }
     } catch (e: any) {
@@ -1547,7 +1631,7 @@ async function pollSMS(orderId: string, ctx: any) {
     await new Promise(r => setTimeout(r, 10000));
   }
   
-  // Таймаут — код не пришёл за 10 минут
+  // Таймаут — код не пришёл за 15 минут
   const current = pendingSMSOrders.get(orderId);
   if (current && current.gen === myGen) {
     pendingSMSOrders.delete(orderId);
@@ -1556,12 +1640,40 @@ async function pollSMS(orderId: string, ctx: any) {
       console.error("[pollSMS] timeout cancel error:", e?.message || e);
     }
     
-    await safeSendMessage(ctx.api, current.chatId,
-      "⏰ *Время ожидания истекло*\n\n" +
-      "SMS-код не был получен за 10 минут.\n" +
-      "Нажмите «🔄 Сменить номер» для заказа нового номера.",
-      { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-    );
+    // Авто-refund Stars при таймауте — код так и не пришёл, покупатель не виноват.
+    let refunded = false;
+    try {
+      const order = await db.order.findUnique({ where: { id: orderId }, select: { number: true, starPaymentChargeId: true, customerTg: true } });
+      if (order?.starPaymentChargeId && order.customerTg) {
+        try {
+          await bot!.api.refundStarPayment(Number(order.customerTg), order.starPaymentChargeId);
+          await db.order.update({ where: { id: orderId }, data: { status: "refunded" } });
+          refunded = true;
+          console.log(`[pollSMS] auto-refund OK for order ${order.number}`);
+        } catch (re: any) {
+          console.error("[pollSMS] auto-refund failed:", re?.message || re);
+        }
+      }
+    } catch (e: any) {
+      console.error("[pollSMS] refund lookup failed:", e?.message || e);
+    }
+    
+    if (refunded) {
+      await safeSendMessage(ctx.api, current.chatId,
+        "⏰ *Время ожидания истекло*\n\n" +
+        "SMS-код не был получен за 15 минут.\n" +
+        "✅ Stars автоматически возвращены на ваш аккаунт.\n" +
+        "Попробуйте заказать номер другой страны.",
+        { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+      );
+    } else {
+      await safeSendMessage(ctx.api, current.chatId,
+        "⏰ *Время ожидания истекло*\n\n" +
+        "SMS-код не был получен за 15 минут.\n" +
+        "Нажмите «🔄 Сменить номер» для заказа нового номера, или обратитесь в поддержку для возврата Stars.",
+        { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+      );
+    }
   }
 }
 
