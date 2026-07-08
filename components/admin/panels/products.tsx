@@ -40,6 +40,7 @@ interface Product {
   title: string
   slug: string
   description: string
+  longDesc?: string | null
   price: number
   oldPrice: number | null
   categoryId: string
