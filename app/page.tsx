@@ -4,26 +4,9 @@ import { useEffect, useState, useRef } from "react"
 import { AdminApp } from "@/components/admin/admin-app"
 import { MiniApp } from "@/components/miniapp/mini-app"
 
-declare global {
-  interface Window {
-    Telegram?: {
-      WebApp?: {
-        ready: () => void
-        expand: () => void
-        initDataUnsafe?: any
-        platform?: string
-        themeParams?: any
-        colorScheme?: string
-        setHeaderColor?: (c: string) => void
-        setBackgroundColor?: (c: string) => void
-        MainButton?: any
-        BackButton?: any
-        HapticFeedback?: any
-        openInvoice?: any
-      }
-    }
-  }
-}
+// Telegram WebApp typing is declared once in components/miniapp/mini-app.tsx
+// (declaring it again here causes TS2717: subsequent property declarations
+// must have the same type).
 
 export default function Home() {
   const [mounted, setMounted] = useState(false)

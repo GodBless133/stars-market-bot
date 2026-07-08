@@ -26,18 +26,17 @@ import {
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 
-// Minimal Telegram WebApp typing
+// Minimal Telegram WebApp typing (single declaration — app/page.tsx relies on this)
 declare global {
   interface Window {
     Telegram?: {
       WebApp?: {
         ready: () => void
         expand: () => void
+        platform?: string
         themeParams?: any
-        colorScheme?: "light" | "dark"
-        initDataUnsafe?: {
-          user?: { id: number; first_name?: string; username?: string }
-        }
+        colorScheme?: "light" | "dark" | string
+        initDataUnsafe?: any
         MainButton?: any
         BackButton?: any
         HapticFeedback?: {
