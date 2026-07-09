@@ -130,7 +130,7 @@ export async function POST(req: NextRequest) {
         include: { items: true },
       })
 
-      // Reserve stock (skip services, mark service items "в работе")
+      // Reserve stock (skip services AND virtual numbers, mark service items "в работе")
       for (const it of created.items) {
         const p = products.find((x) => x.id === it.productId)!
         if (p.type === "service") {
@@ -138,6 +138,17 @@ export async function POST(req: NextRequest) {
             where: { id: it.id },
             data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
           })
+          continue
+        }
+
+        // Virtual numbers: ordered via smsfast.vip at payment time — no StockItem needed.
+        const slugLower = p.slug.toLowerCase()
+        const titleLower = p.title.toLowerCase()
+        const isVirtual =
+          slugLower.includes("nomer") || slugLower.includes("number") ||
+          slugLower.includes("virtual") || slugLower.includes("sms") ||
+          titleLower.includes("виртуальн") || titleLower.includes("номер")
+        if (isVirtual) {
           continue
         }
 

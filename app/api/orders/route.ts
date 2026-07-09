@@ -115,7 +115,7 @@ export async function POST(req: NextRequest) {
         include: { items: true },
       })
 
-      // Reserve stock (skip services)
+      // Reserve stock (skip services AND virtual numbers — they're ordered dynamically)
       for (const it of created.items) {
         const product = products.find((p) => p.id === it.productId)!
         if (product.type === "service") {
@@ -124,6 +124,19 @@ export async function POST(req: NextRequest) {
             where: { id: it.id },
             data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
           })
+          continue
+        }
+
+        // Virtual numbers: ordered via smsfast.vip at payment time — no StockItem needed.
+        // Detect by slug keywords (same logic as /api/products).
+        const slugLower = product.slug.toLowerCase()
+        const titleLower = product.title.toLowerCase()
+        const isVirtual =
+          slugLower.includes("nomer") || slugLower.includes("number") ||
+          slugLower.includes("virtual") || slugLower.includes("sms") ||
+          titleLower.includes("виртуальн") || titleLower.includes("номер")
+        if (isVirtual) {
+          // No stock reservation — number will be ordered after payment
           continue
         }
 
