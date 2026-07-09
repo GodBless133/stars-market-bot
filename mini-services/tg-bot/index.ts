@@ -1442,6 +1442,16 @@ async function setupBot() {
         console.error("[platega-poll] error:", e?.message || e);
       }
 
+      // Virtual number poll — для заказов оплаченных картой (через Platega),
+      // бот должен заказать номер через smsfast.vip и запустить pollSMS.
+      // Stars-платежи обрабатываются в successful_payment handler, но card-платежи
+      // идут через Next.js webhook и бот о них не знает — поэтому poller.
+      try {
+        await processPendingCardPaidVirtualNumbers();
+      } catch (e: any) {
+        console.error("[virtual-poll] error:", e?.message || e);
+      }
+
       if (!bot) return;
       // Ищем заказы со SMM Order в delivered, которые ещё не завершены
       const orders = await db.order.findMany({
@@ -1589,15 +1599,19 @@ async function pollSMS(orderId: string, ctx: any) {
           .text("💬 Поддержка", "support")
           .row()
           .text("⭐ Оставить отзыв", "reviews");
-        
-        await safeSendMessage(ctx.api, current.chatId,
-          `✅ *SMS-код получен!*\n\n` +
-          `📱 Номер: ${phone}\n` +
-          `🔑 *Код: ${status.code}*\n\n` +
-          `Введите этот код в Telegram для входа.\n\n` +
-          `_Код действителен ограниченное время._`,
-          { reply_markup: kb }
-        );
+
+        // Для card-paid заказов chatId=0 — используем tgId как fallback
+        const sendTo = current.chatId || (current.tgId ? Number(current.tgId) : 0);
+        if (sendTo > 0) {
+          await safeSendMessage(ctx.api, sendTo,
+            `✅ *SMS-код получен!*\n\n` +
+            `📱 Номер: ${phone}\n` +
+            `🔑 *Код: ${status.code}*\n\n` +
+            `Введите этот код в Telegram для входа.\n\n` +
+            `_Код действителен ограниченное время._`,
+            { reply_markup: kb }
+          );
+        }
         return;
       }
       
@@ -1619,16 +1633,19 @@ async function pollSMS(orderId: string, ctx: any) {
         } catch (e: any) {
           console.error("[pollSMS] cancel-refund lookup failed:", e?.message || e);
         }
-        if (refunded) {
-          await safeSendMessage(ctx.api, current.chatId,
-            "❌ Номер был отменён сервисом (код не пришёл вовремя).\n\n✅ Stars автоматически возвращены. Попробуйте другую страну.",
-            { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-          );
-        } else {
-          await safeSendMessage(ctx.api, current.chatId,
-            "❌ Номер был отменён. Используйте «🔄 Сменить номер» для заказа нового.",
-            { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-          );
+        const sendToCancel = current.chatId || (current.tgId ? Number(current.tgId) : 0);
+        if (sendToCancel > 0) {
+          if (refunded) {
+            await safeSendMessage(ctx.api, sendToCancel,
+              "❌ Номер был отменён сервисом (код не пришёл вовремя).\n\n✅ Stars автоматически возвращены. Попробуйте другую страну.",
+              { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+            );
+          } else {
+            await safeSendMessage(ctx.api, sendToCancel,
+              "❌ Номер был отменён. Используйте «🔄 Сменить номер» для заказа нового.",
+              { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+            );
+          }
         }
         return;
       }
@@ -1667,21 +1684,24 @@ async function pollSMS(orderId: string, ctx: any) {
       console.error("[pollSMS] refund lookup failed:", e?.message || e);
     }
     
-    if (refunded) {
-      await safeSendMessage(ctx.api, current.chatId,
-        "⏰ *Время ожидания истекло*\n\n" +
-        "SMS-код не был получен за 15 минут.\n" +
-        "✅ Stars автоматически возвращены на ваш аккаунт.\n" +
-        "Попробуйте заказать номер другой страны.",
-        { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-      );
-    } else {
-      await safeSendMessage(ctx.api, current.chatId,
-        "⏰ *Время ожидания истекло*\n\n" +
-        "SMS-код не был получен за 15 минут.\n" +
-        "Нажмите «🔄 Сменить номер» для заказа нового номера, или обратитесь в поддержку для возврата Stars.",
-        { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
-      );
+    const sendToTimeout = current.chatId || (current.tgId ? Number(current.tgId) : 0);
+    if (sendToTimeout > 0) {
+      if (refunded) {
+        await safeSendMessage(ctx.api, sendToTimeout,
+          "⏰ *Время ожидания истекло*\n\n" +
+          "SMS-код не был получен за 15 минут.\n" +
+          "✅ Stars автоматически возвращены на ваш аккаунт.\n" +
+          "Попробуйте заказать номер другой страны.",
+          { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+        );
+      } else {
+        await safeSendMessage(ctx.api, sendToTimeout,
+          "⏰ *Время ожидания истекло*\n\n" +
+          "SMS-код не был получен за 15 минут.\n" +
+          "Нажмите «🔄 Сменить номер» для заказа нового номера, или обратитесь в поддержку для возврата Stars.",
+          { reply_markup: new InlineKeyboard().text("🔄 Сменить номер", `chgnum:${orderId}`) }
+        );
+      }
     }
   }
 }
@@ -2248,6 +2268,152 @@ async function pollPlategaPayments() {
   }
   if (confirmed > 0 || canceled > 0) {
     console.log(`[platega-poll] done: ${confirmed} confirmed, ${canceled} canceled`);
+  }
+}
+
+// processPendingCardPaidVirtualNumbers — for orders paid via card (Platega) that
+// contain a virtual number, the Next.js webhook marks them paid+completed but
+// can't order the SMS number (only the bot can do that via smsfast.vip).
+// This poller finds such orders and orders the number + starts pollSMS.
+async function processPendingCardPaidVirtualNumbers() {
+  // Find orders that are paid/completed via card, with delivered containing
+  // "Номер будет заказан ботом" (the marker set by the webhook), AND not yet
+  // in pendingSMSOrders (so we don't double-order).
+  const orders = await db.order.findMany({
+    where: {
+      payMethod: "card",
+      status: { in: ["paid", "completed"] },
+      items: { some: { delivered: { contains: "Номер будет заказан ботом" } } },
+    },
+    include: { items: true },
+    take: 20,
+  });
+  if (orders.length === 0) return;
+
+  console.log(`[virtual-poll] found ${orders.length} card-paid virtual number orders to process`);
+
+  for (const order of orders) {
+    // Skip if already being polled (pollSMS in progress)
+    if (pendingSMSOrders.has(order.id)) {
+      console.log(`[virtual-poll] ${order.number}: already in pendingSMSOrders, skip`);
+      continue;
+    }
+
+    const firstItem = order.items[0];
+    if (!firstItem) continue;
+    const product = await db.product.findUnique({
+      where: { id: firstItem.productId },
+      include: { category: true },
+    });
+    if (!product) continue;
+
+    // Verify it's a virtual number
+    const catSlug = product.category?.slug ?? "";
+    const slugLower = product.slug.toLowerCase();
+    const titleLower = product.title.toLowerCase();
+    const isVirtual =
+      catSlug === "virtual-numbers" ||
+      slugLower.includes("nomer") || slugLower.includes("number") ||
+      slugLower.includes("virtual") || slugLower.includes("sms") ||
+      titleLower.includes("виртуальн") || titleLower.includes("номер");
+    if (!isVirtual) continue;
+
+    // Determine country (same logic as successful_payment handler)
+    const COUNTRY_FALLBACK_CHAIN = [6, 16, 115, 34, 93];
+    let preferredCountry = 115;
+    if (product.title.includes("Индонез")) preferredCountry = 6;
+    else if (product.title.includes("Канад")) preferredCountry = 34;
+    else if (product.title.includes("США") || product.title.includes("USA")) preferredCountry = 115;
+    else if (product.title.includes("Великобритан") || product.title.includes("UK")) preferredCountry = 16;
+    else if (product.title.includes("Португал")) preferredCountry = 93;
+    const tryCountries = [preferredCountry, ...COUNTRY_FALLBACK_CHAIN.filter(c => c !== preferredCountry)];
+
+    console.log(`[virtual-poll] ordering number for ${order.number} (product: ${product.title})`);
+
+    let result: { id: number; phone: string } | null = null;
+    let usedCountry = preferredCountry;
+    let lastError = "";
+    for (const c of tryCountries) {
+      try {
+        result = await smsOrderNumber("tg", c);
+        usedCountry = c;
+        break;
+      } catch (e: any) {
+        lastError = String(e?.message || e);
+        if (lastError.includes("NO_NUMBERS") || lastError.includes("Нет доступных номеров")) continue;
+        break;
+      }
+    }
+
+    if (!result) {
+      console.error(`[virtual-poll] ${order.number}: all countries failed: ${lastError}`);
+      // Notify admin
+      const adminId = process.env.ADMIN_TG_ID?.trim();
+      if (adminId && bot) {
+        try {
+          await bot.api.sendMessage(adminId,
+            `🚨 Card-paid virtual number order failed!\n\nOrder: ${order.number}\nUser: ${order.customerTg}\nError: ${lastError.slice(0, 150)}\n\nRefund via Platega dashboard.`,
+            { parse_mode: "Markdown" });
+        } catch {}
+      }
+      // Mark order item with error
+      await db.orderItem.updateMany({
+        where: { orderId: order.id },
+        data: { delivered: `⚠️ Не удалось заказать номер: ${lastError.slice(0, 100)}. Обратитесь в поддержку.` },
+      });
+      continue;
+    }
+
+    // Success — set up polling, update order item, notify buyer
+    pendingSMSOrders.set(order.id, {
+      activationId: result.id,
+      phone: result.phone,
+      attempts: 0,
+      chatId: 0, // unknown — we'll send via bot.api.sendMessage to customerTg
+      tgId: order.customerTg || "",
+      country: usedCountry,
+      gen: 0,
+    });
+
+    await db.orderItem.updateMany({
+      where: { orderId: order.id },
+      data: { delivered: `phone: ${result.phone}\nID: ${result.id}\n⏳ Ожидание SMS-кода...` },
+    });
+
+    // Set status to "paid" (not completed) until SMS code arrives
+    await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
+
+    // Notify buyer via bot DM
+    if (bot && order.customerTg) {
+      try {
+        const chatId = Number(order.customerTg);
+        if (Number.isFinite(chatId)) {
+          const kb = new InlineKeyboard()
+            .text("🔄 Сменить номер", `chgnum:${order.id}`)
+            .row()
+            .text("❌ Отменить", `cancelnum:${order.id}`);
+          await safeSendMessage(bot.api, chatId,
+            `📱 *Виртуальный номер заказан!*\n\n` +
+            `📞 Номер: *${result.phone}*\n` +
+            `🔧 ID: ${result.id}\n\n` +
+            `1. Введите этот номер в Telegram\n` +
+            `2. Дождитесь SMS с кодом\n` +
+            `3. Бот автоматически пришлёт код\n\n` +
+            `_Если код не придёт за 10 минут — нажмите «🔄 Сменить номер»_`,
+            { reply_markup: kb }
+          );
+        }
+      } catch (e: any) {
+        console.error(`[virtual-poll] notify buyer failed:`, e?.message || e);
+      }
+    }
+
+    // Start polling for SMS code
+    // Create a fake ctx for pollSMS (it uses ctx.api and ctx.chat)
+    const fakeCtx = { api: bot?.api, chat: { id: 0 } };
+    pollSMS(order.id, fakeCtx);
+
+    console.log(`[virtual-poll] ${order.number}: ordered ${result.phone} (country=${usedCountry}), pollSMS started`);
   }
 }
 
