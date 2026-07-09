@@ -45,8 +45,8 @@ export async function POST(req: NextRequest) {
       amount: order.total,
       currency: order.currency || "RUB",
       description: `Оплата заказа ${order.number}`,
-      returnUrl: `${webappUrl}/?paid=1&order=${order.number}`,
-      failUrl: `${webappUrl}/?paid=0&order=${order.number}`,
+      returnUrl: `${webappUrl}/payment-success?order=${order.number}`,
+      failUrl: `${webappUrl}/payment-failed?order=${order.number}`,
       payload: order.id, // we get this back in webhook
       userId: order.customerTg || undefined,
       userName: order.customerName || undefined,

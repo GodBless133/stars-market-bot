@@ -187,7 +187,9 @@ export async function GET(req: NextRequest) {
     currency: true,
     createdAt: true,
     items: {
-      select: { id: true, title: true, price: true, qty: true },
+      // Include `delivered` so the payment-success page can show the goods.
+      // Order number acts as an unguessable token — if you know it, you can see delivery.
+      select: { id: true, title: true, price: true, qty: true, delivered: true },
     },
   } as const
 
