@@ -256,6 +256,37 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
   // Buy now (single product) via Stars
   const buyNow = (p: Product) => payWithStars([{ productId: p.id, qty: 1 }])
 
+  // Pay with card/SBP via Platega — creates order, then Platega payment URL, opens in browser
+  const payWithCard = async (orderItems: { productId: string; qty: number }[]) => {
+    try {
+      setPaying(true)
+      // 1. Create order (same as Stars flow, but payMethod=card)
+      const { order } = await api.post<{ order: Order }>("/api/orders", {
+        items: orderItems,
+        payMethod: "card",
+      })
+      // 2. Create Platega payment
+      const res = await api.post<{ url: string; transactionId: string }>("/api/platega/create", {
+        orderId: order.id,
+      })
+      // 3. Open Platega payment page in external browser (Telegram WebView can't do card forms well)
+      if (res.url) {
+        window.Telegram?.WebApp?.openLink?.(res.url) || window.open(res.url, "_blank")
+        setView("success")
+      } else {
+        toast.error("Не удалось создать платёж")
+      }
+    } catch (e: any) {
+      console.error("payWithCard error:", e)
+      toast.error(e?.message || "Ошибка оплаты картой")
+    } finally {
+      setPaying(false)
+    }
+  }
+
+  const checkoutCard = () => payWithCard(items.map((i) => ({ productId: i.productId, qty: i.qty })))
+  const buyNowCard = (p: Product) => payWithCard([{ productId: p.id, qty: 1 }])
+
   return (
     <div className="min-h-screen bg-zinc-950 text-white flex flex-col max-w-md mx-auto" style={{ background: "var(--tg-bg, #0a0a0a)" }}>
       {/* Header */}
@@ -769,11 +800,19 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
             </span>
           </div>
           <Button
-            className="w-full bg-gradient-to-br from-amber-500 to-orange-600 rounded-full"
+            className="w-full bg-gradient-to-br from-amber-500 to-orange-600 rounded-full mb-2"
             onClick={checkout}
             disabled={paying}
           >
             {paying ? "Создание счёта..." : `⭐ Оплатить звёздами`}
+          </Button>
+          <Button
+            variant="outline"
+            className="w-full border-white/10 rounded-full"
+            onClick={checkoutCard}
+            disabled={paying}
+          >
+            {paying ? "..." : "💳 Оплатить картой / СБП"}
           </Button>
         </div>
       )}
@@ -795,6 +834,14 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
             disabled={paying || (selectedProduct.inStock === 0 && selectedProduct.type !== "service")}
           >
             {paying ? "..." : `⭐ Купить за ${Math.max(1, Math.round(selectedProduct.price / 1.4))} ⭐`}
+          </Button>
+          <Button
+            variant="outline"
+            className="border-white/10 flex-1 rounded-full"
+            onClick={() => buyNowCard(selectedProduct)}
+            disabled={paying || (selectedProduct.inStock === 0 && selectedProduct.type !== "service")}
+          >
+            {paying ? "..." : "💳 Картой"}
           </Button>
         </div>
       )}

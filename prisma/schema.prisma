@@ -106,6 +106,7 @@ model Order {
   payMethod   String?     // card | stars | crypto | balance
   note        String?
   starPaymentChargeId String?  // Telegram Stars charge id — needed for refundStarPayment
+  plategaTransactionId String?  // Platega.io transaction UUID — for card/SBP payments
   items       OrderItem[]
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
