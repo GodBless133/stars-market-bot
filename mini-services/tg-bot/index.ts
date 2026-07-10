@@ -166,6 +166,7 @@ httpServer.listen(PORT, () => {
 // Определяет тип товара и либо заказывает виртуальный номер, либо ничего
 // (для обычных товаров Next.js webhook уже выдал сток сам).
 async function deliverCardOrder(orderId: string) {
+  console.log(`[deliver-card-order] processing order ${orderId}`);
   const order = await db.order.findUnique({
     where: { id: orderId },
     include: { items: true },
@@ -291,25 +292,76 @@ async function deliverCardOrder(orderId: string) {
     pollSMS(orderId, fakeCtx);
     console.log(`[deliver-card-order] ${order.number}: ordered ${result.phone} (country=${usedCountry}), pollSMS started`);
   } else if (product.type === "service") {
-    // Для накрутки — уведомить покупателя что нужно прислать ссылку
-    if (bot && order.customerTg) {
-      try {
-        const chatId = Number(order.customerTg);
-        if (Number.isFinite(chatId)) {
-          await safeSendMessage(bot.api, chatId,
-            `🚀 *Заказ на накрутку оплачен!*\n\n` +
-            `Услуга: *${product.title}*\n` +
-            `Номер: *${order.number}*\n\n` +
-            `📌 *Пришлите ссылку на канал или пост:*\n` +
-            `• Для подписчиков: @username или https://t.me/канал\n` +
-            `• Для просмотров: https://t.me/канал/123\n` +
-            `• Для реакций: https://t.me/канал/123\n\n` +
-            `_Накрутка начнётся автоматически после получения ссылки._`
-          );
+    // Для накрутки — определить smmServiceKey, установить pendingLinkRequests,
+    // уведомить покупателя что нужно прислать ссылку.
+    let smmServiceKey = "";
+    let quantity = 0;
+    if (product.title.includes("10000") && product.title.includes("просмотр")) { smmServiceKey = "tg-views-10000"; quantity = 10000; }
+    else if (product.title.includes("50000") && product.title.includes("просмотр")) { smmServiceKey = "tg-views-50000"; quantity = 50000; }
+    else if (product.title.includes("1000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-1000"; quantity = 1000; }
+    else if (product.title.includes("5000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-5000"; quantity = 5000; }
+    else if (product.title.includes("10000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-10000"; quantity = 10000; }
+    else if (product.title.includes("1000") && product.title.includes("реакц")) { smmServiceKey = "tg-react-1000"; quantity = 1000; }
+    else if (product.title.includes("150") && product.title.includes("реакц")) { smmServiceKey = "tg-react-150"; quantity = 150; }
+    else if (product.title.includes("100") && product.title.includes("реакц")) { smmServiceKey = "tg-react-100"; quantity = 100; }
+    else if (product.title.includes("50") && product.title.includes("реакц")) { smmServiceKey = "tg-react-50"; quantity = 50; }
+
+    if (smmServiceKey && SMM_SERVICES[smmServiceKey]) {
+      // Установить pendingLinkRequests keyed by order.id (C1 fix)
+      pendingLinkRequests.set(order.id, {
+        orderId: order.id,
+        productTitle: product.title,
+        smmServiceKey,
+        smmServiceId: SMM_SERVICES[smmServiceKey].serviceId,
+        quantity,
+        tgId: order.customerTg || "",
+      });
+
+      await db.orderItem.updateMany({
+        where: { orderId: order.id },
+        data: { delivered: "⏳ Ожидает ссылку для накрутки..." },
+      });
+      // Order stays "paid" — completion happens after smmCreateOrder succeeds
+      // (see message:text link-handler)
+      await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
+
+      console.log(`[deliver-card-order] ${order.number}: boost order set up, waiting for link (key=${smmServiceKey}, qty=${quantity})`);
+
+      // Уведомить покупателя
+      if (bot && order.customerTg) {
+        try {
+          const chatId = Number(order.customerTg);
+          if (Number.isFinite(chatId)) {
+            await safeSendMessage(bot.api, chatId,
+              `🚀 *Заказ на накрутку оплачен!*\n\n` +
+              `Услуга: *${product.title}*\n` +
+              `Номер: *${order.number}*\n\n` +
+              `📌 *Пришлите ссылку на канал или пост:*\n` +
+              `• Для подписчиков: @username или https://t.me/канал\n` +
+              `• Для просмотров: https://t.me/канал/123\n` +
+              `• Для реакций: https://t.me/канал/123\n\n` +
+              `_Накрутка начнётся автоматически после получения ссылки._`
+            );
+          }
+        } catch (e: any) {
+          console.error(`[deliver-card-order] notify boost buyer failed:`, e?.message || e);
         }
-      } catch (e: any) {
-        console.error(`[deliver-card-order] notify boost buyer failed:`, e?.message || e);
       }
+    } else {
+      // SMM service not found — notify admin
+      console.error(`[deliver-card-order] ${order.number}: SMM service not found for title "${product.title}"`);
+      const adminId = process.env.ADMIN_TG_ID?.trim();
+      if (adminId && bot) {
+        try {
+          await bot.api.sendMessage(adminId,
+            `🚨 Накрутка: SMM service не найден!\n\nOrder: ${order.number}\nProduct: ${product.title}\nUser: ${order.customerTg}`
+          );
+        } catch {}
+      }
+      await db.orderItem.updateMany({
+        where: { orderId: order.id },
+        data: { delivered: "⚠️ Услуга не найдена в SMM системе. Обратитесь в поддержку." },
+      });
     }
   }
   // Для обычных товаров (аккаунты, stars) — Next.js webhook уже выдал сток сам.
