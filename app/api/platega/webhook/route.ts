@@ -50,15 +50,52 @@ export async function POST(req: NextRequest) {
           where: { id: order.id },
           data: { status: "paid", plategaTransactionId: transactionId },
         })
-        // Deliver via the same logic the bot uses for Stars payments.
-        // For card payments, the bot is NOT involved in delivery —
-        // the user paid via web, so we deliver via the admin API.
-        try {
-          await deliverOrder(order.id)
-          console.log("[platega/webhook] delivered order", order.number)
-        } catch (e: any) {
-          console.error("[platega/webhook] delivery failed:", e?.message || e)
-          // Leave order as "paid" — admin can complete manually
+
+        // Determine if this order needs bot-side delivery (virtual numbers,
+        // boost services) or can be delivered by Next.js directly (stock items).
+        const firstItem = order.items[0]
+        const product = firstItem ? await db.product.findUnique({
+          where: { id: firstItem.productId },
+          include: { category: true },
+        }) : null
+
+        const needsBotDelivery = product && (
+          product.type === "service" ||
+          (product.category?.slug === "virtual-numbers") ||
+          product.slug.includes("number") || product.slug.includes("virtual") ||
+          product.title.toLowerCase().includes("виртуальн") || product.title.toLowerCase().includes("номер")
+        )
+
+        if (needsBotDelivery) {
+          // Call bot's HTTP endpoint to deliver instantly (order SMS number,
+          // notify buyer about boost link). Bot runs on Railway internal network.
+          const botUrl = process.env.BOT_INTERNAL_URL || "http://localhost:3004"
+          const deliverKey = process.env.DELIVER_KEY || ""
+          try {
+            console.log("[platega/webhook] calling bot /deliver-card-order for", order.number)
+            await fetch(`${botUrl}/deliver-card-order`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Deliver-Key": deliverKey,
+              },
+              body: JSON.stringify({ orderId: order.id }),
+              signal: AbortSignal.timeout(10000),
+            })
+            console.log("[platega/webhook] bot delivery triggered for", order.number)
+          } catch (e: any) {
+            console.error("[platega/webhook] bot delivery call failed:", e?.message || e)
+            // Fallback: bot's 5-min poller will pick it up
+          }
+        } else {
+          // Regular stock item — deliver directly from Next.js
+          try {
+            await deliverOrder(order.id)
+            console.log("[platega/webhook] delivered order", order.number)
+          } catch (e: any) {
+            console.error("[platega/webhook] delivery failed:", e?.message || e)
+            // Leave order as "paid" — admin can complete manually
+          }
         }
       }
     } else if (status === "CANCELED") {

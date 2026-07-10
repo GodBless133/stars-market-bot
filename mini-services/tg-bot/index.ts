@@ -100,8 +100,10 @@ const pendingLinkRequests = new Map<string, { orderId: string; productTitle: str
 const pendingSessionUploads = new Map<string, { productId: string; phone: string; password: string; twoFA: string }>();
 
 // ---------- HTTP health server (Node.js http — работает везде) ----------
-const httpServer = createServer((req, res) => {
+const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url || "", `http://localhost:${PORT}`);
+
+  // Health check
   if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -110,12 +112,208 @@ const httpServer = createServer((req, res) => {
     }));
     return;
   }
+
+  // POST /deliver-card-order — вызывается Next.js webhook Platega сразу
+  // после подтверждения оплаты. Body: { orderId: string }
+  // Бот мгновенно заказывает виртуальный номер / выдаёт товар, без ожидания
+  // 5-минутного poller'а.
+  if (req.method === "POST" && url.pathname === "/deliver-card-order") {
+    try {
+      // Простой shared-secret для авторизации (чтобы никто посторонний не вызывал)
+      const authHeader = req.headers["x-deliver-key"] || "";
+      const expectedKey = process.env.DELIVER_KEY || "";
+      if (expectedKey && authHeader !== expectedKey) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      const { orderId } = body as { orderId?: string };
+
+      if (!orderId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "orderId required" }));
+        return;
+      }
+
+      console.log(`[deliver-card-order] received for order ${orderId}`);
+      // Асинхронно запускаем обработку — не блокируем ответ
+      deliverCardOrder(orderId).catch((e) => {
+        console.error(`[deliver-card-order] failed for ${orderId}:`, e?.message || e);
+      });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, message: "processing started" }));
+    } catch (e: any) {
+      console.error("[deliver-card-order] error:", e?.message || e);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal error" }));
+    }
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "not found" }));
 });
 httpServer.listen(PORT, () => {
   console.log(`[tg-bot] HTTP health server listening on :${PORT}`);
 });
+
+// deliverCardOrder — вызывается из HTTP endpoint при получении card-платежа.
+// Определяет тип товара и либо заказывает виртуальный номер, либо ничего
+// (для обычных товаров Next.js webhook уже выдал сток сам).
+async function deliverCardOrder(orderId: string) {
+  const order = await db.order.findUnique({
+    where: { id: orderId },
+    include: { items: true },
+  });
+  if (!order) {
+    console.log(`[deliver-card-order] order ${orderId} not found`);
+    return;
+  }
+  if (order.status !== "paid" && order.status !== "completed") {
+    console.log(`[deliver-card-order] order ${order.number} status=${order.status}, skip`);
+    return;
+  }
+
+  const firstItem = order.items[0];
+  if (!firstItem) return;
+  const product = await db.product.findUnique({
+    where: { id: firstItem.productId },
+    include: { category: true },
+  });
+  if (!product) return;
+
+  // Проверить, виртуальный ли это номер
+  const catSlug = product.category?.slug ?? "";
+  const slugLower = product.slug.toLowerCase();
+  const titleLower = product.title.toLowerCase();
+  const isVirtual =
+    catSlug === "virtual-numbers" ||
+    slugLower.includes("nomer") || slugLower.includes("number") ||
+    slugLower.includes("virtual") || slugLower.includes("sms") ||
+    titleLower.includes("виртуальн") || titleLower.includes("номер");
+
+  if (isVirtual) {
+    // Заказываем номер через smsfast.vip
+    if (pendingSMSOrders.has(orderId)) {
+      console.log(`[deliver-card-order] ${order.number}: already in pendingSMSOrders, skip`);
+      return;
+    }
+
+    const COUNTRY_FALLBACK_CHAIN = [6, 16, 115, 34, 93];
+    let preferredCountry = 115;
+    if (product.title.includes("Индонез")) preferredCountry = 6;
+    else if (product.title.includes("Канад")) preferredCountry = 34;
+    else if (product.title.includes("США") || product.title.includes("USA")) preferredCountry = 115;
+    else if (product.title.includes("Великобритан") || product.title.includes("UK")) preferredCountry = 16;
+    else if (product.title.includes("Португал")) preferredCountry = 93;
+    const tryCountries = [preferredCountry, ...COUNTRY_FALLBACK_CHAIN.filter(c => c !== preferredCountry)];
+
+    let result: { id: number; phone: string } | null = null;
+    let usedCountry = preferredCountry;
+    let lastError = "";
+    for (const c of tryCountries) {
+      try {
+        console.log(`[deliver-card-order] trying country=${c} for ${order.number}`);
+        result = await smsOrderNumber("tg", c);
+        usedCountry = c;
+        break;
+      } catch (e: any) {
+        lastError = String(e?.message || e);
+        if (lastError.includes("NO_NUMBERS") || lastError.includes("Нет доступных номеров")) continue;
+        break;
+      }
+    }
+
+    if (!result) {
+      console.error(`[deliver-card-order] ${order.number}: all countries failed: ${lastError}`);
+      const adminId = process.env.ADMIN_TG_ID?.trim();
+      if (adminId && bot) {
+        try {
+          await bot.api.sendMessage(adminId,
+            `🚨 Card-paid virtual number failed!\n\nOrder: ${order.number}\nUser: ${order.customerTg}\nError: ${lastError.slice(0, 150)}`,
+          );
+        } catch {}
+      }
+      await db.orderItem.updateMany({
+        where: { orderId: order.id },
+        data: { delivered: `⚠️ Не удалось заказать номер: ${lastError.slice(0, 100)}. Обратитесь в поддержку.` },
+      });
+      return;
+    }
+
+    pendingSMSOrders.set(orderId, {
+      activationId: result.id,
+      phone: result.phone,
+      attempts: 0,
+      chatId: 0,
+      tgId: order.customerTg || "",
+      country: usedCountry,
+      gen: 0,
+    });
+
+    await db.orderItem.updateMany({
+      where: { orderId: order.id },
+      data: { delivered: `phone: ${result.phone}\nID: ${result.id}\n⏳ Ожидание SMS-кода...` },
+    });
+    await db.order.update({ where: { id: order.id }, data: { status: "paid" } });
+
+    // Уведомить покупателя
+    if (bot && order.customerTg) {
+      try {
+        const chatId = Number(order.customerTg);
+        if (Number.isFinite(chatId)) {
+          const kb = new InlineKeyboard()
+            .text("🔄 Сменить номер", `chgnum:${order.id}`)
+            .row()
+            .text("❌ Отменить", `cancelnum:${order.id}`);
+          await safeSendMessage(bot.api, chatId,
+            `📱 *Виртуальный номер заказан!*\n\n` +
+            `📞 Номер: *${result.phone}*\n` +
+            `🔧 ID: ${result.id}\n\n` +
+            `1. Введите этот номер в Telegram\n` +
+            `2. Дождитесь SMS с кодом\n` +
+            `3. Бот автоматически пришлёт код\n\n` +
+            `_Если код не придёт за 10 минут — нажмите «🔄 Сменить номер»_`,
+            { reply_markup: kb }
+          );
+        }
+      } catch (e: any) {
+        console.error(`[deliver-card-order] notify buyer failed:`, e?.message || e);
+      }
+    }
+
+    const fakeCtx = { api: bot?.api, chat: { id: 0 } };
+    pollSMS(orderId, fakeCtx);
+    console.log(`[deliver-card-order] ${order.number}: ordered ${result.phone} (country=${usedCountry}), pollSMS started`);
+  } else if (product.type === "service") {
+    // Для накрутки — уведомить покупателя что нужно прислать ссылку
+    if (bot && order.customerTg) {
+      try {
+        const chatId = Number(order.customerTg);
+        if (Number.isFinite(chatId)) {
+          await safeSendMessage(bot.api, chatId,
+            `🚀 *Заказ на накрутку оплачен!*\n\n` +
+            `Услуга: *${product.title}*\n` +
+            `Номер: *${order.number}*\n\n` +
+            `📌 *Пришлите ссылку на канал или пост:*\n` +
+            `• Для подписчиков: @username или https://t.me/канал\n` +
+            `• Для просмотров: https://t.me/канал/123\n` +
+            `• Для реакций: https://t.me/канал/123\n\n` +
+            `_Накрутка начнётся автоматически после получения ссылки._`
+          );
+        }
+      } catch (e: any) {
+        console.error(`[deliver-card-order] notify boost buyer failed:`, e?.message || e);
+      }
+    }
+  }
+  // Для обычных товаров (аккаунты, stars) — Next.js webhook уже выдал сток сам.
+}
 
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
