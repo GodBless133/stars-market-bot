@@ -25,12 +25,12 @@ export default async function PricingPage() {
         
         <div className="rounded-2xl border border-amber-500/20 bg-amber-50 dark:bg-amber-950/20 p-4 mb-8">
           <p className="text-sm">
-            <strong>Способ оплаты:</strong> Telegram Stars (⭐)<br/>
-            <strong>Курс:</strong> 1 ⭐ ≈ 1.4 ₽ (примерно)<br/>
+            <strong>Способы оплаты:</strong> Telegram Stars (⭐) или банковская карта / СБП<br/>
+            <strong>Курс Stars:</strong> 1 ⭐ ≈ 1.4 ₽<br/>
             <strong>Комиссия:</strong> включена в стоимость
           </p>
         </div>
-        
+
         {Object.entries(grouped).map(([catName, items]) => (
           <div key={catName} className="mb-8">
             <h2 className="text-xl font-semibold mb-3">{catName}</h2>
@@ -43,7 +43,7 @@ export default async function PricingPage() {
                   </div>
                   <div className="text-right flex-shrink-0 ml-4">
                     <p className="font-bold">{p.price} ₽</p>
-                    <p className="text-xs text-amber-600">{Math.max(1, Math.round(p.price * 0.5))} ⭐</p>
+                    <p className="text-xs text-amber-600">{Math.max(1, Math.round(p.price / 1.4))} ⭐</p>
                   </div>
                 </div>
               ))}
