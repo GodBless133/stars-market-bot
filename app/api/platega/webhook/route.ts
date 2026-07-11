@@ -61,6 +61,7 @@ export async function POST(req: NextRequest) {
 
         const needsBotDelivery = product && (
           product.type === "service" ||
+          product.type === "account" ||
           (product.category?.slug === "virtual-numbers") ||
           product.slug.includes("number") || product.slug.includes("virtual") ||
           product.title.toLowerCase().includes("виртуальн") || product.title.toLowerCase().includes("номер")
@@ -151,6 +152,14 @@ async function deliverOrder(orderId: string) {
   for (const it of order.items) {
     const product = await db.product.findUnique({ where: { id: it.productId } })
     if (!product) continue
+
+    // FIX H-2: account-type orders are delivered by the bot (via /deliver-card-order),
+    // which can send the inline "Получить код" button. Skip local delivery here so we
+    // don't mark the orderItem delivered before the bot has a chance to run.
+    if (product.type === "account") {
+      // Skip — bot handles account delivery via /deliver-card-order
+      continue
+    }
 
     // Service/boost: just mark "в работе" — buyer contacts bot/support
     if (product.type === "service") {

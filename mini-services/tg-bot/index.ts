@@ -363,8 +363,71 @@ async function deliverCardOrder(orderId: string) {
         data: { delivered: "⚠️ Услуга не найдена в SMM системе. Обратитесь в поддержку." },
       });
     }
+  } else if (product.type === "account") {
+    // FIX H-2: card-paid account orders — find reserved StockItem(s), mark sold,
+    // send buyer the account data + "📱 Получить код" inline button (so they can fetch
+    // the Telegram login code via mtproto). The webhook's local deliverOrder skips
+    // account-type orders so we own this path.
+    const stock = await db.stockItem.findMany({
+      where: { reservedOrderId: order.id, status: "reserved" },
+      take: firstItem.qty,
+    });
+    if (stock.length > 0) {
+      await db.stockItem.updateMany({
+        where: { id: { in: stock.map(s => s.id) } },
+        data: { status: "sold", soldAt: new Date(), reservedOrderId: null },
+      });
+      const content = stock.map(s => s.content).join("\n");
+      await db.orderItem.update({
+        where: { id: firstItem.id },
+        data: { delivered: content },
+      });
+      await db.product.update({
+        where: { id: product.id },
+        data: { salesCount: { increment: stock.length } },
+      });
+
+      // Отправить покупателю данные аккаунта + кнопку получения кода
+      if (bot && order.customerTg) {
+        try {
+          const chatId = Number(order.customerTg);
+          if (Number.isFinite(chatId)) {
+            const itemId = firstItem.id;
+            const kb = new InlineKeyboard()
+              .text("📱 Получить код входа", `getcode:${itemId}`).row()
+              .text("💬 Поддержка", "support");
+            await safeSendMessage(bot.api, chatId,
+              `🎉 *Заказ оплачен!*\n\n` +
+              `Вот ваш товар:\n\n` +
+              `*${escapeMd(firstItem.title)}*:\n\`\`\`\n${content}\n\`\`\`\n\n` +
+              `⚠️ Для входа:\n` +
+              `1. Введите номер в Telegram\n` +
+              `2. Telegram пришлёт код\n` +
+              `3. Нажмите "📱 Получить код входа"`,
+              { reply_markup: kb }
+            );
+          }
+        } catch (e: any) {
+          console.error(`[deliver-card-order] notify account buyer failed:`, e?.message || e);
+        }
+      }
+
+      await db.order.update({ where: { id: order.id }, data: { status: "completed" } });
+      if (order.customerId) {
+        await db.customer.update({
+          where: { id: order.customerId },
+          data: { totalSpent: { increment: order.total }, ordersCount: { increment: 1 } },
+        });
+      }
+      console.log(`[deliver-card-order] ${order.number}: account delivered, getcode button sent`);
+    } else {
+      await db.orderItem.update({
+        where: { id: firstItem.id },
+        data: { delivered: "⚠️ Недостаточно товара. Свяжитесь с поддержкой." },
+      });
+    }
   }
-  // Для обычных товаров (аккаунты, stars) — Next.js webhook уже выдал сток сам.
+  // Для обычных товаров (stars) — Next.js webhook уже выдал сток сам.
 }
 
 // ---------- Helpers for keyboards ----------
@@ -489,6 +552,119 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
+
+// ---------- Recovery on bot restart (FIX B-1) ----------
+// pendingSMSOrders and pendingLinkRequests are in-memory Maps — a bot restart loses
+// them, leaving paid orders stuck forever. recoverPendingOrders() scans the DB for
+// orders that need follow-up (status=paid with a phone marker, status=paid with the
+// "waiting for link" marker, card-paid virtual-number orders awaiting delivery) and
+// re-populates the Maps + restarts the pollers so delivery resumes.
+async function recoverPendingOrders() {
+  try {
+    console.log("[recovery] scanning for stuck paid orders...");
+
+    // 1. Recover virtual number orders (status=paid, delivered starts with "phone:")
+    const smsOrders = await db.order.findMany({
+      where: { status: "paid", items: { some: { delivered: { startsWith: "phone:" } } } },
+      include: { items: true },
+      take: 50,
+    });
+    for (const order of smsOrders) {
+      const item = order.items[0];
+      if (!item?.delivered) continue;
+      // Parse activationId from delivered ("ID: 12345")
+      const idMatch = item.delivered.match(/ID: (\d+)/);
+      const phoneMatch = item.delivered.match(/phone: ([+\d]+)/);
+      if (!idMatch || !phoneMatch) continue;
+      const activationId = parseInt(idMatch[1], 10);
+      const phone = phoneMatch[1];
+      if (!Number.isFinite(activationId)) continue;
+      if (pendingSMSOrders.has(order.id)) continue; // already active
+
+      console.log(`[recovery] resuming SMS poll for ${order.number} (activation ${activationId})`);
+      pendingSMSOrders.set(order.id, {
+        activationId,
+        phone,
+        attempts: 0,
+        chatId: 0,
+        tgId: order.customerTg || "",
+        country: 115,
+        gen: 0,
+      });
+      const fakeCtx = { api: bot?.api, chat: { id: 0 } };
+      pollSMS(order.id, fakeCtx);
+    }
+
+    // 2. Recover boost orders (status=paid, delivered = "⏳ Ожидает ссылку для накрутки...")
+    const boostOrders = await db.order.findMany({
+      where: { status: "paid", items: { some: { delivered: "⏳ Ожидает ссылку для накрутки..." } } },
+      include: { items: true },
+      take: 50,
+    });
+    for (const order of boostOrders) {
+      if (pendingLinkRequests.has(order.id)) continue;
+      const item = order.items[0];
+      if (!item) continue;
+      const product = await db.product.findUnique({ where: { id: item.productId } });
+      if (!product) continue;
+
+      // Determine smmServiceKey (same matching logic)
+      let smmServiceKey = "";
+      let quantity = 0;
+      if (product.title.includes("10000") && product.title.includes("просмотр")) { smmServiceKey = "tg-views-10000"; quantity = 10000; }
+      else if (product.title.includes("50000") && product.title.includes("просмотр")) { smmServiceKey = "tg-views-50000"; quantity = 50000; }
+      else if (product.title.includes("1000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-1000"; quantity = 1000; }
+      else if (product.title.includes("5000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-5000"; quantity = 5000; }
+      else if (product.title.includes("10000") && product.title.includes("подписчик")) { smmServiceKey = "tg-subs-10000"; quantity = 10000; }
+      else if (product.title.includes("1000") && product.title.includes("реакц")) { smmServiceKey = "tg-react-1000"; quantity = 1000; }
+      else if (product.title.includes("150") && product.title.includes("реакц")) { smmServiceKey = "tg-react-150"; quantity = 150; }
+      else if (product.title.includes("100") && product.title.includes("реакц")) { smmServiceKey = "tg-react-100"; quantity = 100; }
+      else if (product.title.includes("50") && product.title.includes("реакц")) { smmServiceKey = "tg-react-50"; quantity = 50; }
+
+      if (smmServiceKey && SMM_SERVICES[smmServiceKey]) {
+        console.log(`[recovery] resuming boost order ${order.number} (key=${smmServiceKey})`);
+        pendingLinkRequests.set(order.id, {
+          orderId: order.id,
+          productTitle: product.title,
+          smmServiceKey,
+          smmServiceId: SMM_SERVICES[smmServiceKey].serviceId,
+          quantity,
+          tgId: order.customerTg || "",
+        });
+        // Re-notify buyer
+        if (bot && order.customerTg) {
+          try {
+            const chatId = Number(order.customerTg);
+            if (Number.isFinite(chatId)) {
+              await safeSendMessage(bot.api, chatId,
+                `🚀 *Напоминание: ожидаем ссылку для накрутки*\n\n` +
+                `Услуга: *${product.title}*\n` +
+                `Номер: *${order.number}*\n\n` +
+                `📌 *Пришлите ссылку на канал или пост:*\n` +
+                `• Для подписчиков: @username или https://t.me/канал\n` +
+                `• Для просмотров/реакций: https://t.me/канал/123`
+              );
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // 3. Recover card-paid virtual numbers with "Номер будет заказан ботом" marker
+    const cardPending = await db.order.findMany({
+      where: { payMethod: "card", status: { in: ["paid", "completed"] }, items: { some: { delivered: { contains: "Номер будет заказан ботом" } } } },
+      take: 20,
+    });
+    if (cardPending.length > 0) {
+      console.log(`[recovery] ${cardPending.length} card-paid virtual orders need delivery`);
+      // These will be picked up by processPendingCardPaidVirtualNumbers poller
+    }
+
+    console.log("[recovery] done");
+  } catch (e: any) {
+    console.error("[recovery] error:", e?.message || e);
+  }
+}
 
 // ---------- Bot setup ----------
 async function setupBot() {
@@ -1151,8 +1327,11 @@ async function setupBot() {
       const phone = phoneMatch[1].trim();
       
       // Ищем StockItem по phone
+      // FIX M-3: scope by productId so a phone that legitimately exists in two
+      // different account products resolves to the right StockItem (the one tied
+      // to this order's product), not the first match across the whole table.
       const stockItem = await db.stockItem.findFirst({
-        where: { phone },
+        where: { phone, productId: orderItem.productId },
       });
       if (!stockItem || !stockItem.sessionFile) {
         await ctx.answerCallbackQuery({ text: "Session не найдена" });
@@ -1470,6 +1649,12 @@ async function setupBot() {
 
       if (isVirtualNumber) {
         // === ВИРТУАЛЬНЫЙ НОМЕР ===
+        // FIX H-1: idempotency — if a duplicate successful_payment arrives (Telegram
+        // sometimes retries), don't re-order a second SMS number on top of the first.
+        if (pendingSMSOrders.has(order.id)) {
+          await safeReply(ctx, "⏳ Номер уже заказан, ожидайте SMS-код.");
+          return;
+        }
         // Определяем предпочитаемую страну по товару, но при NO_NUMBERS fallback на другие.
         const COUNTRY_FALLBACK_CHAIN = [6, 16, 115, 34, 93]; // Индонезия, Великобритания, США, Канада, Португалия
         let preferredCountry = 115;
@@ -1599,6 +1784,12 @@ async function setupBot() {
 
       if (isBoost) {
         // === НАКРУТКА ===
+        // FIX H-1: idempotency — if a duplicate successful_payment arrives, don't
+        // overwrite the existing pendingLinkRequests entry (would lose state).
+        if (pendingLinkRequests.has(order.id)) {
+          await safeReply(ctx, "⏳ Уже жду ссылку от вас. Пришлите ссылку на пост/канал.");
+          return;
+        }
         let smmServiceKey = "";
         let quantity = 0;
         if (product.title.includes("10000") && product.title.includes("просмотр")) { smmServiceKey = "tg-views-10000"; quantity = 10000; }
@@ -1658,7 +1849,14 @@ async function setupBot() {
         where: { id: order.id },
         include: { items: true },
       });
-      await sendDeliveryMessage(ctx, fresh!);
+      // FIX L-2: don't non-null assert — if the order vanished (concurrent delete / DB
+      // hiccup) between deliverOrder and now, log it and bail instead of crashing the
+      // handler with a TypeError.
+      if (!fresh) {
+        console.error("[tg-bot] successful_payment: order disappeared after delivery", order.id);
+        return;
+      }
+      await sendDeliveryMessage(ctx, fresh);
     } catch (e: any) {
       console.error("[tg-bot] successful_payment error:", e);
       // Показываем номер заказа и краткую ошибку — так поддержка сможет быстро помочь.
@@ -1777,6 +1975,11 @@ async function setupBot() {
     await bot.start({
       onStart: (botInfo) => {
         console.log(`[tg-bot] Bot @${botInfo.username} is up and polling.`);
+        // FIX B-1: recover in-memory pending-order state from the DB so a bot restart
+        // doesn't strand paid virtual-number / boost orders.
+        recoverPendingOrders().catch((e) => {
+          console.error("[recovery] top-level error:", e?.message || e);
+        });
       },
     });
   } catch (e) {
@@ -2131,6 +2334,18 @@ async function showOrders(ctx: any) {
       (itemsLine ? `\n${itemsLine}` : "");
 
     const kb = new InlineKeyboard();
+    // FIX H-3: completed account orders — show a "📱 Получить код" button so the buyer
+    // can fetch the Telegram login code from the stored session without re-running the
+    // full delivery message flow.
+    if (o.status === "completed") {
+      const hasAccount = o.items.some(it => it.delivered && (it.delivered.includes("phone:") || it.delivered.includes("session: stored-in-db")));
+      if (hasAccount) {
+        const accountItem = o.items.find(it => it.delivered?.includes("phone:")) ?? o.items.find(it => it.delivered?.includes("session: stored-in-db"));
+        if (accountItem) {
+          kb.text("📱 Получить код", `getcode:${accountItem.id}`).row();
+        }
+      }
+    }
     if (o.status === "pending") {
       // NOTE: the "✅ Оплатил" button was removed — it bypassed payment and delivered for free.
       // Users pay via the Stars invoice sent at order creation. If they lost it, they cancel and re-order.
@@ -2250,8 +2465,8 @@ async function createOrderFromProduct(ctx: any, productId: string) {
     return;
   }
 
-  // Check stock (skip services)
-  if (product.type !== "service" && !product.slug.includes("nomer") && !product.slug.includes("number") && !product.slug.includes("virtual")) {
+  // Check stock (skip services, virtual numbers, and stars — they don't use StockItem)
+  if (product.type !== "service" && product.type !== "stars" && !product.slug.includes("nomer") && !product.slug.includes("number") && !product.slug.includes("virtual")) {
     const available = await db.stockItem.count({
       where: { productId, status: "available" },
     });
@@ -2310,6 +2525,14 @@ async function createOrderFromProduct(ctx: any, productId: string) {
         where: { id: it.id },
         data: { delivered: "🚀 Заказ принят в работу. Укажите ссылку на канал/пост в чате с поддержкой — старт в течение 1 часа." },
       });
+      continue;
+    }
+    // FIX M-2: stars products are delivered via Telegram Stars payment (the buyer
+    // simply pays the invoice and Stars are debited from their account), NOT from a
+    // StockItem row. Skip stock reservation entirely so a 0-stock stars product can
+    // still be purchased.
+    if (product.type === "stars") {
+      // Stars products delivered via Telegram Stars payment, not from StockItem
       continue;
     }
     // Atomic stock reservation. Pre-fetch available IDs, then run an updateMany that
@@ -2957,6 +3180,13 @@ process.on("SIGTERM", () => { shutdown("SIGTERM").catch((e) => console.error("[s
   console.log("[tg-bot] About to call setupBot...");
   await setupBot();
   console.log("[tg-bot] setupBot completed, botRunning:", botRunning);
+  // FIX B-1: also run recovery at boot end (no-op if setupBot already triggered it
+  // via onStart, but this catches the idle-mode case where BOT_TOKEN is unset so
+  // setupBot never starts the bot — processPendingCardPaidVirtualNumbers poller
+  // can still rescue card-paid orders via the 5-min interval).
+  recoverPendingOrders().catch((e) => {
+    console.error("[recovery] boot error:", e?.message || e);
+  });
 })();
 // trigger: rebuild with sms-numbers import fix
 // trigger: Dockerfile build
