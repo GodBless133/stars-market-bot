@@ -792,57 +792,91 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
 
       {/* Checkout button (cart view) */}
       {view === "cart" && items.length > 0 && (
-        <div className="sticky bottom-0 bg-zinc-950/95 backdrop-blur border-t border-white/5 p-3">
-          <div className="flex items-center justify-between mb-2 px-1">
-            <span className="text-sm text-zinc-400">Итого</span>
-            <span className="text-lg font-bold text-amber-400">
-              {formatPrice(total)} · {Math.max(1, Math.round(total / 1.4))} ⭐
-            </span>
+        <div className="sticky bottom-0 bg-zinc-950/95 backdrop-blur border-t border-white/5 p-4">
+          <div className="flex items-center justify-between mb-3 px-1">
+            <span className="text-sm text-zinc-400">Итого к оплате</span>
+            <div className="text-right">
+              <span className="text-xl font-bold text-amber-400 block leading-tight">{formatPrice(total)}</span>
+              <span className="text-xs text-zinc-500">≈ {Math.max(1, Math.round(total / 1.4))} ⭐</span>
+            </div>
           </div>
-          <Button
-            className="w-full bg-gradient-to-br from-amber-500 to-orange-600 rounded-full mb-2"
+
+          {/* Stars payment — primary */}
+          <button
             onClick={checkout}
             disabled={paying}
+            className="w-full mb-2.5 flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 via-amber-500 to-orange-500 text-zinc-950 font-bold py-3.5 rounded-2xl shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 hover:brightness-105 active:scale-[0.98] transition-all disabled:opacity-50 disabled:active:scale-100"
           >
-            {paying ? "Создание счёта..." : `⭐ Оплатить звёздами`}
-          </Button>
-          <Button
-            variant="outline"
-            className="w-full border-white/10 rounded-full"
+            {paying ? (
+              <><div className="h-5 w-5 rounded-full border-2 border-zinc-900/30 border-t-zinc-900 animate-spin" /> Создание счёта...</>
+            ) : (
+              <><span className="text-lg">⭐</span> Оплатить звёздами</>
+            )}
+          </button>
+
+          {/* Card/SBP payment — secondary */}
+          <button
             onClick={checkoutCard}
             disabled={paying}
+            className="w-full flex items-center justify-center gap-2 bg-zinc-800/80 border border-white/10 text-white font-semibold py-3.5 rounded-2xl hover:bg-zinc-700/80 hover:border-white/20 active:scale-[0.98] transition-all disabled:opacity-50 disabled:active:scale-100"
           >
-            {paying ? "..." : "💳 Оплатить картой / СБП"}
-          </Button>
+            {paying ? "..." : (
+              <>
+                <svg className="h-5 w-5 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <rect x="2" y="5" width="20" height="14" rx="3" />
+                  <path d="M2 10h20" />
+                  <path d="M6 15h4" />
+                </svg>
+                Оплатить картой / СБП
+              </>
+            )}
+          </button>
+
+          {/* Trust badges */}
+          <div className="flex items-center justify-center gap-3 mt-3 text-[10px] text-zinc-600">
+            <span className="flex items-center gap-1"><svg className="h-3 w-3" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1l3.09 6.26L22 8.27l-5 4.87 1.18 6.88L12 16.77l-6.18 3.25L7 13.14 2 8.27l6.91-1.01L12 1z"/></svg> Telegram Stars</span>
+            <span className="flex items-center gap-1"><svg className="h-3 w-3 text-emerald-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2l8 4v6c0 5-3.5 9-8 10-4.5-1-8-5-8-10V6l8-4z"/></svg> Защищённая оплата</span>
+          </div>
         </div>
       )}
 
       {/* Add to cart button (product view) */}
       {view === "product" && selectedProduct && (
-        <div className="sticky bottom-0 bg-zinc-950/95 backdrop-blur border-t border-white/5 p-3 flex gap-2">
-          <Button
-            variant="outline"
-            className="border-white/10 flex-1 rounded-full"
-            onClick={() => addToCart(selectedProduct)}
-            disabled={selectedProduct.inStock === 0 && selectedProduct.type !== "service"}
-          >
-            <Plus className="h-4 w-4 mr-1" /> В корзину
-          </Button>
-          <Button
-            className="flex-[2] bg-gradient-to-br from-amber-500 to-orange-600 rounded-full"
-            onClick={() => buyNow(selectedProduct)}
-            disabled={paying || (selectedProduct.inStock === 0 && selectedProduct.type !== "service")}
-          >
-            {paying ? "..." : `⭐ Купить за ${Math.max(1, Math.round(selectedProduct.price / 1.4))} ⭐`}
-          </Button>
-          <Button
-            variant="outline"
-            className="border-white/10 flex-1 rounded-full"
+        <div className="sticky bottom-0 bg-zinc-950/95 backdrop-blur border-t border-white/5 p-4 space-y-2.5">
+          {/* Primary actions row */}
+          <div className="flex gap-2.5">
+            <button
+              onClick={() => addToCart(selectedProduct)}
+              disabled={selectedProduct.inStock === 0 && selectedProduct.type !== "service"}
+              className="flex items-center justify-center gap-1.5 bg-zinc-800/80 border border-white/10 text-zinc-300 font-medium py-3 px-4 rounded-2xl hover:bg-zinc-700/80 hover:border-white/20 active:scale-95 transition-all disabled:opacity-40 flex-shrink-0"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => buyNow(selectedProduct)}
+              disabled={paying || (selectedProduct.inStock === 0 && selectedProduct.type !== "service")}
+              className="flex-[2] flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 via-amber-500 to-orange-500 text-zinc-950 font-bold py-3 rounded-2xl shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 hover:brightness-105 active:scale-[0.98] transition-all disabled:opacity-50"
+            >
+              {paying ? (
+                <><div className="h-4 w-4 rounded-full border-2 border-zinc-900/30 border-t-zinc-900 animate-spin" /> ...</>
+              ) : (
+                <><span className="text-base">⭐</span> {Math.max(1, Math.round(selectedProduct.price / 1.4))} звёзд</>
+              )}
+            </button>
+          </div>
+
+          {/* Card payment — full width */}
+          <button
             onClick={() => buyNowCard(selectedProduct)}
             disabled={paying || (selectedProduct.inStock === 0 && selectedProduct.type !== "service")}
+            className="w-full flex items-center justify-center gap-2 bg-zinc-800/60 border border-white/10 text-zinc-400 font-medium py-2.5 rounded-2xl hover:bg-zinc-700/60 hover:text-white hover:border-white/15 active:scale-[0.98] transition-all disabled:opacity-40 text-sm"
           >
-            {paying ? "..." : "💳 Картой"}
-          </Button>
+            <svg className="h-4 w-4 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="2" y="5" width="20" height="14" rx="3" />
+              <path d="M2 10h20" />
+            </svg>
+            или картой · {selectedProduct.price} ₽
+          </button>
         </div>
       )}
     </div>
