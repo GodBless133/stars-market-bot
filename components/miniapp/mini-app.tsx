@@ -103,6 +103,9 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
   const [orders, setOrders] = useState<Order[]>([])
   const [orderResult, setOrderResult] = useState<{ number: string; delivered: string | null } | null>(null)
   const [paying, setPaying] = useState(false)
+  const [promoInput, setPromoInput] = useState("")
+  const [promoApplied, setPromoApplied] = useState<{ code: string; type: string; value: number; discountAmount: number } | null>(null)
+  const [promoError, setPromoError] = useState("")
 
   const items = useStore((s) => s.items)
   const add = useStore((s) => s.add)
@@ -113,6 +116,35 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
   const count = useStore((s) => s.count())
   const tgUser = useStore((s) => s.tgUser)
   const setTgUser = useStore((s) => s.setTgUser)
+
+  // Промокод: применить
+  const applyPromo = async () => {
+    if (!promoInput.trim()) return
+    setPromoError("")
+    setPromoApplied(null)
+    try {
+      const res = await api.get<{ valid: boolean; type?: string; value?: number; error?: string }>(
+        `/api/promo/check?code=${encodeURIComponent(promoInput.trim().toUpperCase())}`
+      )
+      if (res.valid && res.type && res.value) {
+        let discountAmount = 0
+        if (res.type === "discount") discountAmount = Math.round(total * res.value / 100)
+        else if (res.type === "fixed") discountAmount = Math.min(res.value, total)
+        else if (res.type === "stars") discountAmount = 0 // bonus stars, not rub discount
+        setPromoApplied({ code: promoInput.trim().toUpperCase(), type: res.type, value: res.value, discountAmount })
+        setPromoInput("")
+        haptic("success")
+      } else {
+        setPromoError(res.error || "Неверный промокод")
+        haptic("error")
+      }
+    } catch (e: any) {
+      setPromoError("Ошибка проверки промокода")
+    }
+  }
+
+  // Итоговая сумма с учётом скидки
+  const finalTotal = promoApplied ? Math.max(0, total - promoApplied.discountAmount) : total
 
   // Init Telegram WebApp
   useEffect(() => {
@@ -203,6 +235,7 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
         items: orderItems,
         customerName: tgUser?.firstName,
         customerTg: tgUser?.id,
+        promoCode: promoApplied?.code || undefined,
       })
 
       const tg = window.Telegram?.WebApp
@@ -260,10 +293,11 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
   const payWithCard = async (orderItems: { productId: string; qty: number }[]) => {
     try {
       setPaying(true)
-      // 1. Create order (same as Stars flow, but payMethod=card)
+      // 1. Create order (same as Stars flow, but payMethod=card + promoCode if applied)
       const { order } = await api.post<{ order: Order }>("/api/orders", {
         items: orderItems,
         payMethod: "card",
+        promoCode: promoApplied?.code || undefined,
       })
       // 2. Create Platega payment
       const res = await api.post<{ url: string; transactionId: string }>("/api/platega/create", {
@@ -793,10 +827,52 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
       {/* Checkout button (cart view) */}
       {view === "cart" && items.length > 0 && (
         <div className="sticky bottom-0 bg-zinc-950/95 backdrop-blur border-t border-white/5 p-4">
+          {/* Промокод */}
+          <div className="mb-3">
+            {promoApplied ? (
+              <div className="flex items-center justify-between bg-emerald-500/10 border border-emerald-500/30 rounded-xl px-3 py-2">
+                <div>
+                  <span className="text-xs text-emerald-400 font-medium">✓ Промокод {promoApplied.code}</span>
+                  {promoApplied.discountAmount > 0 && (
+                    <span className="text-xs text-emerald-400 block">−{formatPrice(promoApplied.discountAmount)}</span>
+                  )}
+                </div>
+                <button
+                  onClick={() => { setPromoApplied(null); haptic("light") }}
+                  className="text-zinc-500 hover:text-red-400 text-xs"
+                >
+                  ✕ Убрать
+                </button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={promoInput}
+                  onChange={(e) => { setPromoInput(e.target.value); setPromoError("") }}
+                  onKeyDown={(e) => e.key === "Enter" && applyPromo()}
+                  placeholder="Промокод"
+                  className="flex-1 bg-zinc-800/60 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/50"
+                />
+                <button
+                  onClick={applyPromo}
+                  disabled={!promoInput.trim()}
+                  className="bg-zinc-700/80 hover:bg-zinc-600/80 disabled:opacity-30 text-white text-sm font-medium px-4 rounded-xl transition-all active:scale-95"
+                >
+                  Применить
+                </button>
+              </div>
+            )}
+            {promoError && <p className="text-xs text-red-400 mt-1 px-1">{promoError}</p>}
+          </div>
+
           <div className="flex items-center justify-between mb-3 px-1">
             <span className="text-sm text-zinc-400">Итого к оплате</span>
             <div className="text-right">
-              <span className="text-xl font-bold text-amber-400 block leading-tight">{formatPrice(total)}</span>
+              {promoApplied && promoApplied.discountAmount > 0 && (
+                <span className="text-xs text-zinc-500 line-through block leading-tight">{formatPrice(total)}</span>
+              )}
+              <span className="text-xl font-bold text-amber-400 block leading-tight">{formatPrice(finalTotal)}</span>
             </div>
           </div>
 

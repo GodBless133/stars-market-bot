@@ -8,12 +8,13 @@ export const dynamic = "force-dynamic"
 // Create order (public, from storefront / mini app / bot)
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}))
-  const { items, customerTg, customerName, payMethod, note } = body as {
+  const { items, customerTg, customerName, payMethod, note, promoCode } = body as {
     items: { productId: string; qty: number; title?: string }[]
     customerTg?: string
     customerName?: string
     payMethod?: string
     note?: string
+    promoCode?: string
   }
 
   // FIX 1: validate Telegram initData. If the header is present but invalid
@@ -87,6 +88,28 @@ export async function POST(req: NextRequest) {
     return sum + p.price * it.qty
   }, 0)
 
+  // Apply promo code if provided
+  let finalTotal = total
+  let appliedPromoCode: string | null = null
+  if (promoCode) {
+    try {
+      const promo = await db.promoCode.findUnique({ where: { code: promoCode.toUpperCase() } })
+      if (promo && promo.active && promo.usesCount < promo.maxUses &&
+          (!promo.expiresAt || promo.expiresAt > new Date())) {
+        if (promo.type === "discount") {
+          finalTotal = Math.max(0, Math.round(total * (1 - promo.value / 100)))
+        } else if (promo.type === "fixed") {
+          finalTotal = Math.max(0, total - promo.value)
+        }
+        appliedPromoCode = promo.code
+        // Increment uses
+        await db.promoCode.update({ where: { id: promo.id }, data: { usesCount: { increment: 1 } } })
+      }
+    } catch (e) {
+      console.error("[api/orders] promo code error:", e)
+    }
+  }
+
   try {
     // FIX 3c: atomic order creation + stock reservation
     const order = await db.$transaction(async (tx) => {
@@ -97,9 +120,9 @@ export async function POST(req: NextRequest) {
           customerTg: effectiveTgId || null,
           customerName: customerName || null,
           status: "pending",
-          total,
+          total: finalTotal,
           payMethod: payMethod || "card",
-          note,
+          note: appliedPromoCode ? `Промокод: ${appliedPromoCode}${note ? " | " + note : ""}` : note,
           items: {
             create: dedupedItems.map((it) => {
               const p = products.find((x) => x.id === it.productId)!
