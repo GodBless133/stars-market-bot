@@ -709,8 +709,17 @@ async function setupBot() {
       console.error("[start] welcome bonus check failed:", e?.message || e);
     }
 
+    // Get bot username ONCE for referral links
+    let botUsername = "StarsMarkeet_bot";
+    try {
+      if (bot) {
+        const botInfo = await bot.api.getMe();
+        botUsername = botInfo.username || botUsername;
+      }
+    } catch {}
+
     // Check for referral param: /start ref_XXXXXX
-    const startPayload = ctx.match?.[1] || (ctx.message as any)?.text?.split(" ")[1] || "";
+    const startPayload = ctx.match?.[1] || (ctx.message as any)?.text?.split(/\s+/)[1] || "";
     if (startPayload && startPayload.startsWith("ref_")) {
       const referrerTgId = startPayload.replace("ref_", "");
       try {
@@ -728,6 +737,7 @@ async function setupBot() {
       } catch {}
     }
 
+    const refLink = `https://t.me/${botUsername}?start=ref_${tgId}`;
     let text: string;
     if (isNewCustomer) {
       text =
@@ -737,13 +747,13 @@ async function setupBot() {
         `• \`WELCOME10\` — скидка 10% (100 использований)\n` +
         `• \`LAUNCH15\` — скидка 15% (только 25 штук!)\n\n` +
         `💬 Пригласите друга и получите бонус после его первой покупки!\n` +
-        `Ваша реферальная ссылка:\nhttps://t.me/${(await bot?.api.getMe())?.username || "StarsMarkeet_bot"}?start=ref_${tgId}\n\n` +
+        `Ваша реферальная ссылка:\n${refLink}\n\n` +
         `Выберите действие из меню ниже 👇`;
     } else {
       text =
         `👋 *С возвращением, ${escapeMd(firstName)}!*\n\n` +
         `${escapeMd(s.tagline)}\n\n` +
-        `💬 Реферальная ссылка (приглашайте друзей!):\nhttps://t.me/${(await bot?.api.getMe())?.username || "StarsMarkeet_bot"}?start=ref_${tgId}\n\n` +
+        `💬 Реферальная ссылка (приглашайте друзей!):\n${refLink}\n\n` +
         `Выберите действие из меню ниже 👇`;
     }
     await safeReply(ctx, text, {
@@ -804,8 +814,13 @@ async function setupBot() {
   // /referral — реферальная ссылка
   bot.command("referral", async (ctx) => {
     const tgId = String(ctx.from?.id ?? "");
-    const botInfo = await bot?.api.getMe();
-    const botUsername = botInfo?.username || "StarsMarkeet_bot";
+    let botUsername = "StarsMarkeet_bot";
+    try {
+      if (bot) {
+        const botInfo = await bot.api.getMe();
+        botUsername = botInfo.username || botUsername;
+      }
+    } catch {}
     const refLink = `https://t.me/${botUsername}?start=ref_${tgId}`;
 
     // Count referrals
@@ -1159,6 +1174,65 @@ async function setupBot() {
         await ctx.reply("❌ Ошибка: " + String(e?.message || e).slice(0, 100));
       }
     }
+  });
+
+  // /broadcast <url or text> — рассылка всем клиентам (admin only)
+  // /broadcast https://t.me/StarsMarkeet/8 → пересылает пост из канала
+  // /broadcast Текст сообщения → отправляет текст
+  bot.command("broadcast", async (ctx) => {
+    const adminId = process.env.ADMIN_TG_ID?.trim();
+    const userId = String(ctx.from?.id ?? "");
+    if (!adminId || userId !== adminId) return;
+    const args = ctx.message?.text?.split(/\s+/).slice(1).join(" ") || "";
+    if (!args) {
+      await ctx.reply("Использование:\n/broadcast https://t.me/канал/123 — переслать пост\n/broadcast Текст — отправить текст всем");
+      return;
+    }
+
+    await ctx.reply("📤 Начинаю рассылку...");
+
+    // Get all customers with tgId
+    const customers = await db.customer.findMany({
+      where: { tgId: { not: null } },
+      select: { tgId: true },
+    });
+
+    let sent = 0;
+    let failed = 0;
+
+    for (const c of customers) {
+      if (!c.tgId) continue;
+      try {
+        // If it's a t.me link — forward the post
+        if (args.includes("t.me/") && args.match(/\/(\d+)$/)) {
+          // Parse channel + message ID from URL like https://t.me/StarsMarkeet/8
+          const urlMatch = args.match(/t\.me\/([^/]+)\/(\d+)/);
+          if (urlMatch) {
+            const channelUsername = urlMatch[1];
+            const messageId = parseInt(urlMatch[2], 10);
+            await bot!.api.forwardMessage(
+              Number(c.tgId),
+              `@${channelUsername}`,
+              messageId
+            );
+          } else {
+            // Just send the URL as text
+            await safeSendMessage(bot!.api, Number(c.tgId), args);
+          }
+        } else {
+          // Send as text
+          await safeSendMessage(bot!.api, Number(c.tgId), args);
+        }
+        sent++;
+        // Rate limit: ~25 msg/sec to avoid 429
+        await new Promise(r => setTimeout(r, 40));
+      } catch (e: any) {
+        failed++;
+        // User may have blocked the bot — skip silently
+      }
+    }
+
+    await ctx.reply(`✅ Рассылка завершена!\n\nОтправлено: ${sent}\nНе доставлено: ${failed}\nВсего клиентов: ${customers.length}`);
   });
 
   // /legal — юридические документы
