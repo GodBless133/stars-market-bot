@@ -13,6 +13,7 @@ async function request<T = any>(
 ): Promise<T> {
   const res = await fetch(url, {
     ...options,
+    credentials: "include", // send admin_session cookie for /api/admin/* requests
     headers: {
       "Content-Type": "application/json",
       "x-telegram-init-data": getInitData(),

@@ -19,6 +19,7 @@ export function AdminLogin({ onBack }: { onBack: () => void }) {
     try {
       const res = await fetch("/api/admin/login", {
         method: "POST",
+        credentials: "include", // ensure Set-Cookie (admin_session) is accepted by browser
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
       })
