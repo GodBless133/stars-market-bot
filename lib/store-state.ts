@@ -9,6 +9,7 @@ export interface CartItem {
   price: number
   image?: string
   qty: number
+  type?: string
 }
 
 export type AppMode = "store" | "admin" | "miniapp"

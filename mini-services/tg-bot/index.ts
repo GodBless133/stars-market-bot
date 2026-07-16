@@ -433,7 +433,6 @@ async function deliverCardOrder(orderId: string) {
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
   const kb = new Keyboard()
-    .text("🛍 Каталог")
     .text("⭐ Купить Звёзды")
     .row()
     .text("📦 Мои заказы")
@@ -447,7 +446,6 @@ function mainMenuKeyboard() {
 
 function mainMenuInline() {
   const kb = new InlineKeyboard()
-    .text("🛍 Каталог", "catalog")
     .text("⭐ Звёзды", "stars")
     .row()
     .text("📦 Мои заказы", "orders")
@@ -705,7 +703,6 @@ async function setupBot() {
       `/start — Главное меню\n` +
       `/help — Список команд\n\n` +
       `*Кнопки меню:*\n` +
-      `🛍 Каталог — категории и товары\n` +
       `⭐ Купить Звёзды — быстрый список звёзд\n` +
       `📦 Мои заказы — последние заказы\n` +
       `💬 Поддержка — контакт поддержки\n` +
@@ -1055,7 +1052,8 @@ async function setupBot() {
   // ============ КОНЕЦ АДМИН-КОМАНД ============
 
   // Text-based menu (hears)
-  bot.hears("🛍 Каталог", (ctx) => showCategories(ctx));
+  // Каталог убран из меню — покупки через мини-апп
+  // bot.hears("🛍 Каталог", ...) removed
   bot.hears("⭐ Купить Звёзды", (ctx) => showStars(ctx));
   bot.hears("📦 Мои заказы", (ctx) => showOrders(ctx));
   bot.hears("💬 Поддержка", (ctx) => showSupport(ctx));
