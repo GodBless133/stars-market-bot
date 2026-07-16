@@ -395,6 +395,48 @@ export function MiniApp({ onExit }: { onExit: () => void }) {
               ))}
             </div>
 
+            {/* Промокод — на главной, без корзины */}
+            <div className="rounded-2xl bg-zinc-900/60 border border-white/10 p-4">
+              {promoApplied ? (
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="text-sm text-emerald-400 font-medium">✓ Промокод {promoApplied.code} активирован</span>
+                    <span className="text-xs text-emerald-400 block">
+                      {promoApplied.type === "discount" ? `Скидка ${promoApplied.value}%` : promoApplied.type === "fixed" ? `Скидка ${promoApplied.value}₽` : `${promoApplied.value} бонусных ⭐`}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => { setPromoApplied(null); haptic("light") }}
+                    className="text-zinc-500 hover:text-red-400 text-xs"
+                  >
+                    ✕ Убрать
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <p className="text-xs text-zinc-400 mb-2">🎁 Есть промокод? Введите для скидки:</p>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={promoInput}
+                      onChange={(e) => { setPromoInput(e.target.value); setPromoError("") }}
+                      onKeyDown={(e) => e.key === "Enter" && applyPromo()}
+                      placeholder="Например: WELCOME10"
+                      className="flex-1 bg-zinc-800/60 border border-white/10 rounded-xl px-3 py-2 text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-amber-500/50"
+                    />
+                    <button
+                      onClick={applyPromo}
+                      disabled={!promoInput.trim()}
+                      className="bg-gradient-to-r from-amber-500 to-orange-500 text-zinc-950 text-sm font-bold px-4 rounded-xl transition-all active:scale-95 disabled:opacity-30"
+                    >
+                      OK
+                    </button>
+                  </div>
+                  {promoError && <p className="text-xs text-red-400 mt-1">{promoError}</p>}
+                </>
+              )}
+            </div>
+
             {/* Reviews banner */}
             <a
               href="/reviews"
