@@ -85,6 +85,8 @@ model Customer {
   totalSpent   Float       @default(0)
   ordersCount  Int         @default(0)
   banned       Boolean     @default(false)
+  referralCode String?
+  welcomeBonusGiven Boolean @default(false)
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   orders       Order[]
@@ -158,4 +160,20 @@ model Settings {
   currency  String   @default("RUB")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model PromoCode {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  type        String   @default("discount") // discount (percent) | fixed (rub amount) | stars (bonus stars)
+  value       Float    // percent: 10 = 10% off | fixed: 50 = 50 rub off | stars: 10 = 10 bonus stars
+  maxUses     Int      @default(100)
+  usesCount   Int      @default(0)
+  active      Boolean  @default(true)
+  expiresAt   DateTime?
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([code])
+  @@index([active])
 }

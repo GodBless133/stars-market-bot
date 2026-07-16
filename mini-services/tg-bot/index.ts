@@ -687,10 +687,66 @@ async function setupBot() {
   // /start
   bot.command("start", async (ctx) => {
     const s = await getSettings();
-    const text =
-      `👋 Добро пожаловать в *${escapeMd(s.storeName)}*!\n\n` +
-      `${escapeMd(s.tagline)}\n\n` +
-      `Выберите действие из меню ниже 👇`;
+    const tgId = String(ctx.from?.id ?? "");
+    const firstName = ctx.from?.first_name || "Покупатель";
+
+    // Check if new customer — give welcome bonus
+    let isNewCustomer = false;
+    try {
+      const existing = await db.customer.findUnique({ where: { tgId } });
+      if (!existing) {
+        isNewCustomer = true;
+        // Create customer with referral code
+        const referralCode = "REF" + tgId.slice(-6);
+        await db.customer.create({
+          data: { tgId, firstName, referralCode, welcomeBonusGiven: true },
+        });
+      } else if (!existing.welcomeBonusGiven) {
+        isNewCustomer = true;
+        await db.customer.update({ where: { id: existing.id }, data: { welcomeBonusGiven: true } });
+      }
+    } catch (e: any) {
+      console.error("[start] welcome bonus check failed:", e?.message || e);
+    }
+
+    // Check for referral param: /start ref_XXXXXX
+    const startPayload = ctx.match?.[1] || (ctx.message as any)?.text?.split(" ")[1] || "";
+    if (startPayload && startPayload.startsWith("ref_")) {
+      const referrerTgId = startPayload.replace("ref_", "");
+      try {
+        const referrer = await db.customer.findUnique({ where: { tgId: referrerTgId } });
+        if (referrer && referrer.tgId !== tgId) {
+          // Notify referrer
+          if (bot) {
+            try {
+              await safeSendMessage(bot.api, Number(referrerTgId),
+                `🎉 *Новый реферал!*\n\n${firstName} присоединился по вашей ссылке.\n\nКогда он сделает первый заказ — вы получите бонус!`,
+              );
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
+    let text: string;
+    if (isNewCustomer) {
+      text =
+        `👋 *Добро пожаловать, ${escapeMd(firstName)}!*\n\n` +
+        `${escapeMd(s.tagline)}\n\n` +
+        `🎁 *Бонус для новых клиентов:*\n` +
+        `• Промокод \`WELCOME10\` — скидка 10%\n` +
+        `• Промокод \`FIRST50\` — 50₽ на первый заказ\n` +
+        `• Промокод \`LAUNCH\` — скидка 20% (лимитировано!)\n\n` +
+        `💬 Пригласите друга и получите бонус после его первой покупки!\n` +
+        `Ваша реферальная ссылка:\nhttps://t.me/${(await bot?.api.getMe())?.username || "StarsMarkeet_bot"}?start=ref_${tgId}\n\n` +
+        `Выберите действие из меню ниже 👇`;
+    } else {
+      text =
+        `👋 *С возвращением, ${escapeMd(firstName)}!*\n\n` +
+        `${escapeMd(s.tagline)}\n\n` +
+        `💬 Реферальная ссылка (приглашайте друзей!):\nhttps://t.me/${(await bot?.api.getMe())?.username || "StarsMarkeet_bot"}?start=ref_${tgId}\n\n` +
+        `Выберите действие из меню ниже 👇`;
+    }
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
@@ -701,7 +757,9 @@ async function setupBot() {
     const text =
       `*Справка по командам*\n\n` +
       `/start — Главное меню\n` +
-      `/help — Список команд\n\n` +
+      `/help — Список команд\n` +
+      `/promo — Активные промокоды\n` +
+      `/referral — Ваша реферальная ссылка\n\n` +
       `*Кнопки меню:*\n` +
       `⭐ Купить Звёзды — быстрый список звёзд\n` +
       `📦 Мои заказы — последние заказы\n` +
@@ -710,6 +768,69 @@ async function setupBot() {
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
+  });
+
+  // /promo — показать активные промокоды
+  bot.command("promo", async (ctx) => {
+    try {
+      const promos = await db.promoCode.findMany({
+        where: { active: true, usesCount: { lt: db.promoCode.fields.maxUses } },
+        orderBy: { value: "desc" },
+        take: 10,
+      });
+      if (promos.length === 0) {
+        await safeReply(ctx, "Сейчас нет активных промокодов 😔\n\nСледите за новостями!", {
+          reply_markup: mainMenuInline(),
+        });
+        return;
+      }
+      let text = `🎁 *Активные промокоды:*\n\n`;
+      for (const p of promos) {
+        const remaining = p.maxUses - p.usesCount;
+        let discount = "";
+        if (p.type === "discount") discount = `скидка ${p.value}%`;
+        else if (p.type === "fixed") discount = `${p.value}₽`;
+        else if (p.type === "stars") discount = `${p.value} бонусных ⭐`;
+        text += `• \`${p.code}\` — ${discount}\n`;
+        if (p.note) text += `  ${escapeMd(p.note)}\n`;
+        text += `  Осталось: ${remaining} использований\n\n`;
+      }
+      text += `Введите промокод при оплате в мини-апп!`;
+      await safeReply(ctx, text);
+    } catch (e: any) {
+      await safeReply(ctx, "Ошибка загрузки промокодов. Попробуйте позже.");
+    }
+  });
+
+  // /referral — реферальная ссылка
+  bot.command("referral", async (ctx) => {
+    const tgId = String(ctx.from?.id ?? "");
+    const botInfo = await bot?.api.getMe();
+    const botUsername = botInfo?.username || "StarsMarkeet_bot";
+    const refLink = `https://t.me/${botUsername}?start=ref_${tgId}`;
+
+    // Count referrals
+    let refCount = 0;
+    try {
+      const customer = await db.customer.findUnique({ where: { tgId } });
+      if (customer) {
+        // Count customers who were referred by this user (via referralCode)
+        refCount = await db.customer.count({
+          where: { referralCode: "REF" + tgId.slice(-6) },
+        }) - 1; // exclude self
+      }
+    } catch {}
+
+    const text =
+      `💬 *Реферальная программа*\n\n` +
+      `Приглашайте друзей и получайте бонусы!\n\n` +
+      `📱 *Ваша ссылка:*\n${refLink}\n\n` +
+      `👥 Приглашено: ${Math.max(0, refCount)} чел.\n\n` +
+      `*Как это работает:*\n` +
+      `1. Отправьте ссылку другу\n` +
+      `2. Друг регистрируется и делает заказ\n` +
+      `3. Вы получаете бонусный промокод!`;
+    await safeReply(ctx, text);
   });
 
   // ============ АДМИН-КОМАНДЫ ============
@@ -994,6 +1115,50 @@ async function setupBot() {
       await ctx.reply(`✅ Рефанд выполнен.\nЗаказ: ${order.number}\nCharge: ${order.starPaymentChargeId}`);
     } catch (e: any) {
       await ctx.reply(`❌ Ошибка: ${String(e?.message || e).slice(0, 200)}`);
+    }
+  });
+
+  // /addpromo <code> <type> <value> <maxUses> — создать промокод (admin only)
+  // type: discount (percent) | fixed (rub) | stars (bonus stars)
+  // Example: /addpromo SUMMER20 discount 20 100
+  bot.command("addpromo", async (ctx) => {
+    const adminId = process.env.ADMIN_TG_ID?.trim();
+    const userId = String(ctx.from?.id ?? "");
+    if (!adminId || userId !== adminId) return;
+    const parts = ctx.message?.text?.split(/\s+/) || [];
+    if (parts.length < 5) {
+      await ctx.reply("Использование: /addpromo <code> <type> <value> <maxUses>\nТипы: discount (%) | fixed (₽) | stars (⭐)\nПример: /addpromo SUMMER20 discount 20 100");
+      return;
+    }
+    const [, code, type, valueStr, maxUsesStr] = parts;
+    const value = Number(valueStr);
+    const maxUses = Number(maxUsesStr);
+    if (!["discount", "fixed", "stars"].includes(type)) {
+      await ctx.reply("Тип должен быть: discount | fixed | stars");
+      return;
+    }
+    if (!Number.isFinite(value) || value <= 0) {
+      await ctx.reply("value должно быть положительным числом");
+      return;
+    }
+    if (!Number.isFinite(maxUses) || maxUses < 1) {
+      await ctx.reply("maxUses должно быть ≥ 1");
+      return;
+    }
+    try {
+      const crypto = await import("crypto");
+      const id = "c" + Date.now().toString(16) + crypto.randomBytes(8).toString("hex").slice(0, 16);
+      await db.promoCode.create({
+        data: { id, code: code.toUpperCase(), type, value, maxUses, usesCount: 0, active: true },
+      });
+      let desc = type === "discount" ? `${value}% скидка` : type === "fixed" ? `${value}₽` : `${value} бонусных ⭐`;
+      await ctx.reply(`✅ Промокод создан!\n\nКод: ${code.toUpperCase()}\nТип: ${desc}\nЛимит: ${maxUses} использований`);
+    } catch (e: any) {
+      if (e?.code === "P2002") {
+        await ctx.reply("❌ Промокод с таким кодом уже существует");
+      } else {
+        await ctx.reply("❌ Ошибка: " + String(e?.message || e).slice(0, 100));
+      }
     }
   });
 
