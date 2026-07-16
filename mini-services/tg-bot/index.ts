@@ -684,6 +684,28 @@ async function setupBot() {
     console.error("[bot] update:", JSON.stringify(err.ctx?.update ?? null).slice(0, 500));
   });
 
+  // Middleware: save EVERY user to DB on ANY interaction (message, callback, etc.)
+  // This ensures all 277+ bot users are in the DB for /broadcast.
+  bot.use(async (ctx, next) => {
+    if (ctx.from) {
+      const tgId = String(ctx.from.id);
+      const firstName = ctx.from.first_name || null;
+      const lastName = ctx.from.last_name || null;
+      const username = ctx.from.username || null;
+      try {
+        await db.customer.upsert({
+          where: { tgId },
+          update: { firstName, lastName, username },
+          create: { tgId, firstName, lastName, username },
+        });
+      } catch (e: any) {
+        // Non-critical — don't block the user's request
+        console.error("[middleware] customer upsert failed:", e?.message || e);
+      }
+    }
+    await next();
+  });
+
   // /start
   bot.command("start", async (ctx) => {
     const s = await getSettings();
@@ -1189,50 +1211,65 @@ async function setupBot() {
       return;
     }
 
-    await ctx.reply("📤 Начинаю рассылку...");
-
-    // Get all customers with tgId
+    // Get all customers with numeric tgId
     const customers = await db.customer.findMany({
       where: { tgId: { not: null } },
-      select: { tgId: true },
+      select: { tgId: true, firstName: true },
     });
+
+    // Filter to only valid numeric tgId
+    const validCustomers = customers.filter(c => c.tgId && /^\d+$/.test(c.tgId));
+    const total = validCustomers.length;
+
+    await ctx.reply(`📤 Начинаю рассылку ${total} пользователям...\n(всего в БД: ${customers.length})`);
 
     let sent = 0;
     let failed = 0;
+    let blocked = 0;
+    let lastProgressUpdate = 0;
 
-    for (const c of customers) {
-      if (!c.tgId) continue;
+    // Parse forward params if t.me link
+    let forwardParams: { channel: string; messageId: number } | null = null;
+    const urlMatch = args.match(/t\.me\/([^/]+)\/(\d+)/);
+    if (urlMatch) {
+      forwardParams = { channel: `@${urlMatch[1]}`, messageId: parseInt(urlMatch[2], 10) };
+    }
+
+    for (let i = 0; i < validCustomers.length; i++) {
+      const c = validCustomers[i];
+      const chatId = Number(c.tgId);
       try {
-        // If it's a t.me link — forward the post
-        if (args.includes("t.me/") && args.match(/\/(\d+)$/)) {
-          // Parse channel + message ID from URL like https://t.me/StarsMarkeet/8
-          const urlMatch = args.match(/t\.me\/([^/]+)\/(\d+)/);
-          if (urlMatch) {
-            const channelUsername = urlMatch[1];
-            const messageId = parseInt(urlMatch[2], 10);
-            await bot!.api.forwardMessage(
-              Number(c.tgId),
-              `@${channelUsername}`,
-              messageId
-            );
-          } else {
-            // Just send the URL as text
-            await safeSendMessage(bot!.api, Number(c.tgId), args);
-          }
+        if (forwardParams) {
+          await bot!.api.forwardMessage(chatId, forwardParams.channel, forwardParams.messageId);
         } else {
-          // Send as text
-          await safeSendMessage(bot!.api, Number(c.tgId), args);
+          await safeSendMessage(bot!.api, chatId, args);
         }
         sent++;
-        // Rate limit: ~25 msg/sec to avoid 429
-        await new Promise(r => setTimeout(r, 40));
       } catch (e: any) {
+        if (e?.error_code === 403 || String(e?.message || "").includes("blocked")) {
+          blocked++;
+        }
         failed++;
-        // User may have blocked the bot — skip silently
+      }
+      // Rate limit: 40ms between messages (~25/sec)
+      await new Promise(r => setTimeout(r, 40));
+
+      // Progress update every 50 messages
+      if (i > 0 && i % 50 === 0 && i !== lastProgressUpdate) {
+        lastProgressUpdate = i;
+        try {
+          await ctx.reply(`📤 Прогресс: ${i}/${total} (отправлено: ${sent})`);
+        } catch {}
       }
     }
 
-    await ctx.reply(`✅ Рассылка завершена!\n\nОтправлено: ${sent}\nНе доставлено: ${failed}\nВсего клиентов: ${customers.length}`);
+    await ctx.reply(
+      `✅ Рассылка завершена!\n\n` +
+      `📊 Всего: ${total}\n` +
+      `✅ Отправлено: ${sent}\n` +
+      `❌ Не доставлено: ${failed}\n` +
+      `🚫 Заблокировали бота: ${blocked}`
+    );
   });
 
   // /legal — юридические документы
