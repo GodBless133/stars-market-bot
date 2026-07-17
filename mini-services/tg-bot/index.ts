@@ -433,25 +433,24 @@ async function deliverCardOrder(orderId: string) {
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
   const kb = new Keyboard()
-    .text("🌐 Открыть магазин")
-    .row()
-    .text("📦 Мои заказы")
-    .text("⭐ Отзывы")
+    .text("🛒 Магазин")
+    .text("📦 Заказы")
     .row()
     .text("💬 Поддержка")
-    .text("📋 Правовая информация");
+    .text("ℹ️ Ещё");
   return kb;
 }
 
 function mainMenuInline() {
   const kb = new InlineKeyboard()
-    .text("🌐 Открыть магазин", "open_store")
+    .text("🛒 Магазин", "open_store")
+    .text("📦 Заказы", "orders")
     .row()
-    .text("📦 Мои заказы", "orders")
     .text("⭐ Отзывы", "reviews")
-    .row()
     .text("💬 Поддержка", "support")
-    .text("📋 Правовая информация", "legal");
+    .row()
+    .text("📋 Правовая информация", "legal")
+    .text("🎁 Промокоды", "show_promos");
   return kb;
 }
 
@@ -790,9 +789,10 @@ async function setupBot() {
       `/promo — Активные промокоды\n` +
       `/referral — Ваша реферальная ссылка\n\n` +
       `*Кнопки меню:*\n` +
-      `🌐 Открыть магазин — каталог и оплата картой/звёздами\n` +
-      `📦 Мои заказы — последние заказы\n` +
-      `💬 Поддержка — контакт поддержки`;
+      `🛒 Магазин — каталог и оплата картой/звёздами\n` +
+      `📦 Заказы — ваши заказы\n` +
+      `💬 Поддержка — связь с нами\n` +
+      `ℹ️ Ещё — отзывы, промокоды, рефералы, правовая инфа`;
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
@@ -1324,11 +1324,18 @@ async function setupBot() {
   // ============ КОНЕЦ АДМИН-КОМАНД ============
 
   // Text-based menu (hears)
-  // Каталог и Звёзды убраны — все покупки через «Открыть магазин»
-  bot.hears("📦 Мои заказы", (ctx) => showOrders(ctx));
+  bot.hears("🛒 Магазин", (ctx) => openStore(ctx));
+  bot.hears("📦 Заказы", (ctx) => showOrders(ctx));
   bot.hears("💬 Поддержка", (ctx) => showSupport(ctx));
-  bot.hears("🌐 Открыть магазин", (ctx) => openStore(ctx));
-  bot.hears("⭐ Отзывы", (ctx) => showReviews(ctx));
+  bot.hears("ℹ️ Ещё", async (ctx) => {
+    const kb = new InlineKeyboard()
+      .text("⭐ Отзывы", "reviews")
+      .text("🎁 Промокоды", "show_promos")
+      .row()
+      .text("📋 Правовая информация", "legal")
+      .text("💬 Реферальная ссылка", "show_referral");
+    await safeReply(ctx, "ℹ️ *Дополнительные функции:*\n\nВыберите нужный раздел:", { reply_markup: kb });
+  });
 
   // ---------- Inline callbacks ----------
   bot.callbackQuery("catalog", async (ctx) => {
@@ -1432,6 +1439,58 @@ async function setupBot() {
       { reply_markup: kb }
     );
     await ctx.answerCallbackQuery();
+  });
+
+  // 🎁 Промокоды (inline)
+  bot.callbackQuery("show_promos", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    try {
+      const promos = await db.promoCode.findMany({
+        where: { active: true, usesCount: { lt: db.promoCode.fields.maxUses } },
+        orderBy: { value: "desc" },
+        take: 10,
+      });
+      if (promos.length === 0) {
+        await safeReply(ctx, "Сейчас нет активных промокодов 😔");
+        return;
+      }
+      let text = `🎁 *Активные промокоды:*\n\n`;
+      for (const p of promos) {
+        const remaining = p.maxUses - p.usesCount;
+        let discount = "";
+        if (p.type === "discount") discount = `скидка ${p.value}%`;
+        else if (p.type === "fixed") discount = `${p.value}₽`;
+        text += `• \`${p.code}\` — ${discount} (${remaining} осталось)\n`;
+      }
+      text += `\nВводите промокод в магазине при оплате!`;
+      await safeReply(ctx, text);
+    } catch {
+      await safeReply(ctx, "Ошибка загрузки промокодов.");
+    }
+  });
+
+  // 💬 Реферальная ссылка (inline)
+  bot.callbackQuery("show_referral", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const tgId = String(ctx.from?.id ?? "");
+    let botUsername = "StarsMarkeet_bot";
+    try {
+      if (bot) {
+        const botInfo = await bot.api.getMe();
+        botUsername = botInfo.username || botUsername;
+      }
+    } catch {}
+    const refLink = `https://t.me/${botUsername}?start=ref_${tgId}`;
+    let refCount = 0;
+    try {
+      refCount = await db.customer.count({ where: { referralCode: "REF" + tgId.slice(-6) } }) - 1;
+    } catch {}
+    await safeReply(ctx,
+      `💬 *Реферальная программа*\n\n` +
+      `📱 *Ваша ссылка:*\n\`${refLink}\`\n\n` +
+      `👥 Приглашено: ${Math.max(0, refCount)} чел.\n\n` +
+      `Приглашайте друзей — получайте бонусы после их покупок!`
+    );
   });
 
   // ---------- Смена виртуального номера ----------
