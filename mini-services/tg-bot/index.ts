@@ -433,24 +433,27 @@ async function deliverCardOrder(orderId: string) {
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
   const kb = new Keyboard()
-    .text("🛒")
-    .text("📦")
+    .text("⭐ Купить Звёзды")
+    .text("🛒 Магазин")
     .row()
-    .text("💬")
-    .text("ℹ️");
+    .text("📦 Мои заказы")
+    .text("⭐ Отзывы")
+    .row()
+    .text("💬 Поддержка")
+    .text("ℹ️ Ещё");
   return kb;
 }
 
 function mainMenuInline() {
   const kb = new InlineKeyboard()
+    .text("⭐ Звёзды", "stars")
     .text("🛒 Магазин", "open_store")
+    .row()
     .text("📦 Заказы", "orders")
-    .row()
     .text("⭐ Отзывы", "reviews")
-    .text("💬 Поддержка", "support")
     .row()
-    .text("📋 Правовая информация", "legal")
-    .text("🎁 Промокоды", "show_promos");
+    .text("💬 Поддержка", "support")
+    .text("ℹ️ Ещё", "more_menu");
   return kb;
 }
 
@@ -789,10 +792,11 @@ async function setupBot() {
       `/promo — Активные промокоды\n` +
       `/referral — Ваша реферальная ссылка\n\n` +
       `*Кнопки меню:*\n` +
-      `🛒 — магазин (оплата картой/звёздами)\n` +
-      `📦 — ваши заказы\n` +
-      `💬 — поддержка\n` +
-      `ℹ️ — отзывы, промокоды, рефералы, правовая инфа`;
+      `⭐ Купить Звёзды — оплата картой / СБП\n` +
+      `🛒 Магазин — каталог и оплата картой/звёздами\n` +
+      `📦 Мои заказы — ваши заказы\n` +
+      `💬 Поддержка — связь с нами\n` +
+      `ℹ️ Ещё — отзывы, промокоды, рефералы, правовая инфа`;
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
@@ -1323,11 +1327,13 @@ async function setupBot() {
 
   // ============ КОНЕЦ АДМИН-КОМАНД ============
 
-  // Text-based menu (hears) — иконки-кнопки
-  bot.hears("🛒", (ctx) => openStore(ctx));
-  bot.hears("📦", (ctx) => showOrders(ctx));
-  bot.hears("💬", (ctx) => showSupport(ctx));
-  bot.hears("ℹ️", async (ctx) => {
+  // Text-based menu (hears)
+  bot.hears("⭐ Купить Звёзды", (ctx) => showStars(ctx));
+  bot.hears("🛒 Магазин", (ctx) => openStore(ctx));
+  bot.hears("📦 Мои заказы", (ctx) => showOrders(ctx));
+  bot.hears("💬 Поддержка", (ctx) => showSupport(ctx));
+  bot.hears("⭐ Отзывы", (ctx) => showReviews(ctx));
+  bot.hears("ℹ️ Ещё", async (ctx) => {
     const kb = new InlineKeyboard()
       .text("⭐ Отзывы", "reviews")
       .text("🎁 Промокоды", "show_promos")
@@ -1346,6 +1352,58 @@ async function setupBot() {
   bot.callbackQuery("stars", async (ctx) => {
     await showStars(ctx);
     await ctx.answerCallbackQuery();
+  });
+
+  // buystarscard:<productId> — покупка Stars-пакета картой через Platega
+  bot.callbackQuery(/^buystarscard:(.+)$/, async (ctx) => {
+    const productId = ctx.match[1];
+    const tgId = String(ctx.from?.id ?? "");
+    await ctx.answerCallbackQuery({ text: "💳 Создание платежа..." });
+    try {
+      // 1. Create order via internal API
+      const orderRes = await fetch(`${process.env.WEBAPP_URL?.replace(/\/$/, "") || "https://starsshop-production.up.railway.app"}/api/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: [{ productId, qty: 1 }],
+          customerTg: tgId,
+          customerName: ctx.from?.first_name || "Покупатель",
+          payMethod: "card",
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const orderData = await orderRes.json();
+      if (!orderRes.ok) {
+        await safeReply(ctx, `❌ Ошибка: ${orderData.error || "не удалось создать заказ"}`);
+        return;
+      }
+      const orderId = orderData.order.id;
+
+      // 2. Create Platega payment
+      const plategaRes = await fetch(`${process.env.WEBAPP_URL?.replace(/\/$/, "") || "https://starsshop-production.up.railway.app"}/api/platega/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderId }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const plategaData = await plategaRes.json();
+      if (!plategaRes.ok || !plategaData.url) {
+        await safeReply(ctx, `❌ Ошибка платёжной системы: ${plategaData.error || "попробуйте позже"}`);
+        return;
+      }
+
+      // 3. Send payment link to user
+      const kb = new InlineKeyboard().url("💳 Оплатить", plategaData.url).row().text("⬅️ Меню", "back_to_menu");
+      await safeReply(ctx,
+        `💳 *Оплата заказа ${orderData.order.number}*\n\n` +
+        `Сумма: ${orderData.order.total} ₽\n\n` +
+        `Нажмите кнопку ниже для оплаты:`,
+        { reply_markup: kb }
+      );
+    } catch (e: any) {
+      console.error("[buystarscard] error:", e?.message || e);
+      await safeReply(ctx, "❌ Ошибка при создании платежа. Попробуйте позже.");
+    }
   });
 
   bot.callbackQuery("orders", async (ctx) => {
@@ -2600,23 +2658,15 @@ async function showStars(ctx: any) {
     return;
   }
 
-  await safeReply(ctx, "⭐ *Покупка Telegram Звёзд*\nВыберите пакет:");
+  await safeReply(ctx, "⭐ *Покупка Telegram Звёзд*\nОплата картой / СБП\n\nВыберите пакет:");
 
   for (const p of products) {
-    const stock = await db.stockItem.count({
-      where: { productId: p.id, status: "available" },
-    });
-    // M11: stars products are delivered via Telegram Stars payment, not from StockItem —
-    // don't hide them just because StockItem count is 0.
-    if (p.type !== "stars" && stock <= 0) continue;
-    const ratingLine = p.rating > 0 ? `${stars(p.rating)} ${p.rating.toFixed(1)}` : "";
     const text =
       `*${escapeMd(p.title)}*\n` +
       `${escapeMd(p.description)}\n` +
-      `💰 ${formatPrice(p.price, p.currency)}` +
-      (ratingLine ? `\n${ratingLine}` : "") +
-      `\n📦 В наличии: ${stock}`;
-    const kb = new InlineKeyboard().text("🛒 Купить", `buy:${p.id}`);
+      `💰 ${formatPrice(p.price, p.currency)}`;
+    // Оплата картой через Platega
+    const kb = new InlineKeyboard().text("💳 Купить картой", `buystarscard:${p.id}`);
     await safeReply(ctx, text, { reply_markup: kb });
   }
 }
