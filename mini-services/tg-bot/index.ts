@@ -433,30 +433,28 @@ async function deliverCardOrder(orderId: string) {
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
   const kb = new Keyboard()
-    .text("⭐ Купить Звёзды")
+    .text("🌐 Открыть магазин")
     .row()
     .text("📦 Мои заказы")
     .text("⭐ Отзывы")
     .row()
     .text("💬 Поддержка")
-    .text("🌐 Открыть магазин")
-    .resized();
+    .text("📋 Правовая информация");
   return kb;
 }
 
 function mainMenuInline() {
   const kb = new InlineKeyboard()
-    .text("⭐ Звёзды", "stars")
+    .text("🌐 Открыть магазин", "open_store")
     .row()
     .text("📦 Мои заказы", "orders")
     .text("⭐ Отзывы", "reviews")
     .row()
     .text("💬 Поддержка", "support")
-    .text("🌐 Открыть магазин", "open_store")
-    .row()
     .text("📋 Правовая информация", "legal");
   return kb;
 }
+
 
 async function getSettings() {
   let s = await db.settings.findUnique({ where: { id: "singleton" } });
@@ -792,10 +790,9 @@ async function setupBot() {
       `/promo — Активные промокоды\n` +
       `/referral — Ваша реферальная ссылка\n\n` +
       `*Кнопки меню:*\n` +
-      `⭐ Купить Звёзды — быстрый список звёзд\n` +
+      `🌐 Открыть магазин — каталог и оплата картой/звёздами\n` +
       `📦 Мои заказы — последние заказы\n` +
-      `💬 Поддержка — контакт поддержки\n` +
-      `🌐 Открыть магазин — открыть веб-приложение`;
+      `💬 Поддержка — контакт поддержки`;
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
@@ -1327,9 +1324,7 @@ async function setupBot() {
   // ============ КОНЕЦ АДМИН-КОМАНД ============
 
   // Text-based menu (hears)
-  // Каталог убран из меню — покупки через мини-апп
-  // bot.hears("🛍 Каталог", ...) removed
-  bot.hears("⭐ Купить Звёзды", (ctx) => showStars(ctx));
+  // Каталог и Звёзды убраны — все покупки через «Открыть магазин»
   bot.hears("📦 Мои заказы", (ctx) => showOrders(ctx));
   bot.hears("💬 Поддержка", (ctx) => showSupport(ctx));
   bot.hears("🌐 Открыть магазин", (ctx) => openStore(ctx));
