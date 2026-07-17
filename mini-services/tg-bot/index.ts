@@ -433,11 +433,11 @@ async function deliverCardOrder(orderId: string) {
 // ---------- Helpers for keyboards ----------
 function mainMenuKeyboard() {
   const kb = new Keyboard()
-    .text("🛒 Магазин")
-    .text("📦 Заказы")
+    .text("🛒")
+    .text("📦")
     .row()
-    .text("💬 Поддержка")
-    .text("ℹ️ Ещё");
+    .text("💬")
+    .text("ℹ️");
   return kb;
 }
 
@@ -789,10 +789,10 @@ async function setupBot() {
       `/promo — Активные промокоды\n` +
       `/referral — Ваша реферальная ссылка\n\n` +
       `*Кнопки меню:*\n` +
-      `🛒 Магазин — каталог и оплата картой/звёздами\n` +
-      `📦 Заказы — ваши заказы\n` +
-      `💬 Поддержка — связь с нами\n` +
-      `ℹ️ Ещё — отзывы, промокоды, рефералы, правовая инфа`;
+      `🛒 — магазин (оплата картой/звёздами)\n` +
+      `📦 — ваши заказы\n` +
+      `💬 — поддержка\n` +
+      `ℹ️ — отзывы, промокоды, рефералы, правовая инфа`;
     await safeReply(ctx, text, {
       reply_markup: mainMenuKeyboard(),
     });
@@ -1323,18 +1323,18 @@ async function setupBot() {
 
   // ============ КОНЕЦ АДМИН-КОМАНД ============
 
-  // Text-based menu (hears)
-  bot.hears("🛒 Магазин", (ctx) => openStore(ctx));
-  bot.hears("📦 Заказы", (ctx) => showOrders(ctx));
-  bot.hears("💬 Поддержка", (ctx) => showSupport(ctx));
-  bot.hears("ℹ️ Ещё", async (ctx) => {
+  // Text-based menu (hears) — иконки-кнопки
+  bot.hears("🛒", (ctx) => openStore(ctx));
+  bot.hears("📦", (ctx) => showOrders(ctx));
+  bot.hears("💬", (ctx) => showSupport(ctx));
+  bot.hears("ℹ️", async (ctx) => {
     const kb = new InlineKeyboard()
       .text("⭐ Отзывы", "reviews")
       .text("🎁 Промокоды", "show_promos")
       .row()
-      .text("📋 Правовая информация", "legal")
-      .text("💬 Реферальная ссылка", "show_referral");
-    await safeReply(ctx, "ℹ️ *Дополнительные функции:*\n\nВыберите нужный раздел:", { reply_markup: kb });
+      .text("📋 Правовая", "legal")
+      .text("💬 Реферал", "show_referral");
+    await safeReply(ctx, "ℹ️ *Ещё:*\n\nВыберите раздел:", { reply_markup: kb });
   });
 
   // ---------- Inline callbacks ----------
@@ -2737,13 +2737,13 @@ async function showReviews(ctx: any) {
       text += `Пока нет отзывов. Будьте первым!\n\n`;
     }
     
-    text += `📝 *Читать все отзывы и оставить свой:*\n${reviewsUrl}`;
+    text += `📝 *Читать все отзывы и оставить свой:*\n${reviewsUrl}\n\n💬 *Отзывы в Telegram:*\n@StarsMarkeet`;
 
     const kb = new InlineKeyboard()
-      .url("🌐 Открыть все отзывы", reviewsUrl)
+      .url("🌐 Все отзывы", reviewsUrl)
+      .url("💬 TG-канал", "https://t.me/StarsMarkeet")
       .row()
-      // M1: dedicated back_to_menu callback (was "noop" which actually meant "товара нет в наличии").
-      .text("⬅️ В меню", "back_to_menu");
+      .text("⬅️ Меню", "back_to_menu");
     
     // H6: a long batch of reviews could push the message past 4096 chars — chunk it.
     await safeReplyLong(ctx, text, { reply_markup: kb });
