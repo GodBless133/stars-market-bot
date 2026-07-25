@@ -15,6 +15,7 @@ import {
   ExternalLink,
   LogOut,
   Zap,
+  Gift,
 } from "lucide-react"
 import { AdminDashboard } from "./panels/dashboard"
 import { AdminProducts } from "./panels/products"
@@ -22,13 +23,15 @@ import { AdminOrders } from "./panels/orders"
 import { AdminReviews } from "./panels/reviews"
 import { AdminCustomers } from "./panels/customers"
 import { AdminSettings } from "./panels/settings"
+import { AdminPromos } from "./panels/promos"
 
-type Tab = "dashboard" | "products" | "orders" | "reviews" | "customers" | "settings"
+type Tab = "dashboard" | "products" | "orders" | "reviews" | "customers" | "promos" | "settings"
 
 const NAV: { id: Tab; label: string; icon: any }[] = [
   { id: "dashboard", label: "Дашборд", icon: LayoutDashboard },
   { id: "products", label: "Товары", icon: Package },
   { id: "orders", label: "Заказы", icon: ShoppingCart },
+  { id: "promos", label: "Промокоды", icon: Gift },
   { id: "reviews", label: "Отзывы", icon: Star },
   { id: "customers", label: "Клиенты", icon: Users },
   { id: "settings", label: "Настройки", icon: Settings },
@@ -116,6 +119,7 @@ export function AdminShell({ onExit }: { onExit: () => void }) {
           {tab === "dashboard" && <AdminDashboard />}
           {tab === "products" && <AdminProducts />}
           {tab === "orders" && <AdminOrders />}
+          {tab === "promos" && <AdminPromos />}
           {tab === "reviews" && <AdminReviews />}
           {tab === "customers" && <AdminCustomers />}
           {tab === "settings" && <AdminSettings />}
