@@ -1155,19 +1155,30 @@ async function setupBot() {
     }
   });
 
-  // /addpromo <code> <type> <value> <maxUses> — создать промокод (admin only)
-  // type: discount (percent) | fixed (rub) | stars (bonus stars)
-  // Example: /addpromo SUMMER20 discount 20 100
+  // /addpromo — создать промокод (admin only)
+  // Формат: /addpromo <code> <type> <value> <maxUses> [tgId]
+  // type: discount (%) | fixed (₽) | stars (⭐)
+  // Если указан tgId — персональный промокод (только для этого пользователя)
+  // Примеры:
+  //   /addpromo SUMMER20 discount 20 100
+  //   /addpromo VIP10 discount 10 1 7264716736  ← персональный для tgId
   bot.command("addpromo", async (ctx) => {
     const adminId = process.env.ADMIN_TG_ID?.trim();
     const userId = String(ctx.from?.id ?? "");
     if (!adminId || userId !== adminId) return;
     const parts = ctx.message?.text?.split(/\s+/) || [];
     if (parts.length < 5) {
-      await ctx.reply("Использование: /addpromo <code> <type> <value> <maxUses>\nТипы: discount (%) | fixed (₽) | stars (⭐)\nПример: /addpromo SUMMER20 discount 20 100");
+      await ctx.reply(
+        "Использование:\n" +
+        "/addpromo <code> <type> <value> <maxUses> [tgId]\n\n" +
+        "Типы: discount (%) | fixed (₽) | stars (⭐)\n\n" +
+        "Примеры:\n" +
+        "/addpromo SUMMER20 discount 20 100 — обычный\n" +
+        "/addpromo VIP10 discount 10 1 7264716736 — персональный"
+      );
       return;
     }
-    const [, code, type, valueStr, maxUsesStr] = parts;
+    const [, code, type, valueStr, maxUsesStr, assignedTgId] = parts;
     const value = Number(valueStr);
     const maxUses = Number(maxUsesStr);
     if (!["discount", "fixed", "stars"].includes(type)) {
@@ -1186,16 +1197,72 @@ async function setupBot() {
       const crypto = await import("crypto");
       const id = "c" + Date.now().toString(16) + crypto.randomBytes(8).toString("hex").slice(0, 16);
       await db.promoCode.create({
-        data: { id, code: code.toUpperCase(), type, value, maxUses, usesCount: 0, active: true },
+        data: {
+          id,
+          code: code.toUpperCase(),
+          type, value, maxUses,
+          usesCount: 0, active: true,
+          revenue: 0, revenueOrders: 0,
+          assignedToTgId: assignedTgId || null,
+        },
       });
       let desc = type === "discount" ? `${value}% скидка` : type === "fixed" ? `${value}₽` : `${value} бонусных ⭐`;
-      await ctx.reply(`✅ Промокод создан!\n\nКод: ${code.toUpperCase()}\nТип: ${desc}\nЛимит: ${maxUses} использований`);
+      let msg = `✅ Промокод создан!\n\nКод: ${code.toUpperCase()}\nТип: ${desc}\nЛимит: ${maxUses} использований`;
+      if (assignedTgId) {
+        msg += `\n👤 Персональный для: ${assignedTgId}`;
+      }
+      await ctx.reply(msg);
     } catch (e: any) {
       if (e?.code === "P2002") {
         await ctx.reply("❌ Промокод с таким кодом уже существует");
       } else {
         await ctx.reply("❌ Ошибка: " + String(e?.message || e).slice(0, 100));
       }
+    }
+  });
+
+  // /promostats — статистика по промокодам (admin only)
+  bot.command("promostats", async (ctx) => {
+    const adminId = process.env.ADMIN_TG_ID?.trim();
+    const userId = String(ctx.from?.id ?? "");
+    if (!adminId || userId !== adminId) return;
+
+    try {
+      const promos = await db.promoCode.findMany({
+        orderBy: { revenue: "desc" },
+      });
+
+      if (promos.length === 0) {
+        await ctx.reply("Промокодов пока нет.");
+        return;
+      }
+
+      let totalRevenue = 0;
+      let totalOrders = 0;
+      let totalUses = 0;
+
+      let text = `📊 *Статистика промокодов*\n\n`;
+      text += `| Код | Тип | Исп. | Заказов | Доход |\n`;
+      text += `|-----|-----|------|---------|-------|\n`;
+
+      for (const p of promos) {
+        const discount = p.type === "discount" ? `${p.value}%` : p.type === "fixed" ? `${p.value}₽` : `${p.value}⭐`;
+        const assignedTag = p.assignedToTgId ? ` 👤` : "";
+        text += `| ${p.code}${assignedTag} | ${discount} | ${p.usesCount}/${p.maxUses} | ${p.revenueOrders} | ${p.revenue}₽ |\n`;
+        totalRevenue += p.revenue;
+        totalOrders += p.revenueOrders;
+        totalUses += p.usesCount;
+      }
+
+      text += `\n*ИТОГО:*\n`;
+      text += `💵 Всего дохода: ${totalRevenue}₽\n`;
+      text += `📦 Всего заказов: ${totalOrders}\n`;
+      text += `🎟️ Всего использований: ${totalUses}\n`;
+      text += `📋 Промокодов: ${promos.length}`;
+
+      await safeReply(ctx, text);
+    } catch (e: any) {
+      await ctx.reply("❌ Ошибка: " + String(e?.message || e).slice(0, 100));
     }
   });
 

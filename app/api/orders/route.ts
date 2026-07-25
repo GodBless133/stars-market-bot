@@ -102,8 +102,21 @@ export async function POST(req: NextRequest) {
           finalTotal = Math.max(0, total - promo.value)
         }
         appliedPromoCode = promo.code
-        // Increment uses
-        await db.promoCode.update({ where: { id: promo.id }, data: { usesCount: { increment: 1 } } })
+        // Check if personal promo is assigned to a specific user
+        if (promo.assignedToTgId && effectiveTgId && promo.assignedToTgId !== effectiveTgId) {
+          appliedPromoCode = null
+          finalTotal = total
+        } else {
+          // Increment uses + track revenue (order total BEFORE discount = what customer would've paid)
+          await db.promoCode.update({
+            where: { id: promo.id },
+            data: {
+              usesCount: { increment: 1 },
+              revenue: { increment: finalTotal },
+              revenueOrders: { increment: 1 },
+            },
+          })
+        }
       }
     } catch (e) {
       console.error("[api/orders] promo code error:", e)

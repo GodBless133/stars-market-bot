@@ -163,17 +163,21 @@ model Settings {
 }
 
 model PromoCode {
-  id          String   @id @default(cuid())
-  code        String   @unique
-  type        String   @default("discount") // discount (percent) | fixed (rub amount) | stars (bonus stars)
-  value       Float    // percent: 10 = 10% off | fixed: 50 = 50 rub off | stars: 10 = 10 bonus stars
-  maxUses     Int      @default(100)
-  usesCount   Int      @default(0)
-  active      Boolean  @default(true)
-  expiresAt   DateTime?
-  note        String?
-  createdAt   DateTime @default(now())
+  id            String   @id @default(cuid())
+  code          String   @unique
+  type          String   @default("discount") // discount (percent) | fixed (rub amount) | stars (bonus stars)
+  value         Float    // percent: 10 = 10% off | fixed: 50 = 50 rub off | stars: 10 = 10 bonus stars
+  maxUses       Int      @default(100)
+  usesCount     Int      @default(0)
+  active        Boolean  @default(true)
+  expiresAt     DateTime?
+  note          String?
+  revenue       Float    @default(0)
+  revenueOrders Int      @default(0)
+  assignedToTgId String?  // персональный промокод для конкретного пользователя
+  createdAt     DateTime @default(now())
 
   @@index([code])
   @@index([active])
+  @@index([assignedToTgId])
 }
