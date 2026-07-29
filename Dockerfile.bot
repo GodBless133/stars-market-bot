@@ -1,0 +1,23 @@
+FROM node:20-slim
+
+WORKDIR /app/mini-services/tg-bot
+
+# Install dependencies
+COPY mini-services/tg-bot/package.json mini-services/tg-bot/package-lock.json* ./
+RUN npm install --omit=dev || npm install
+
+# Copy bot source
+COPY mini-services/tg-bot/ ./
+COPY prisma/ /app/prisma/
+
+# Generate Prisma client
+RUN npx prisma generate --schema /app/mini-services/tg-bot/prisma/schema.prisma
+
+# Install tsx for running TypeScript
+RUN npm install tsx
+
+# Expose port
+EXPOSE 3004
+
+# Start
+CMD ["npx", "tsx", "index.ts"]

@@ -1,0 +1,92 @@
+# Render.com Blueprint — деплой всего стека
+# https://render.com/docs/blueprint-spec
+# Создайте файл render.yaml в корне репозитория и подключите к Render
+
+services:
+  # === PostgreSQL ===
+  - type: postgres
+    name: starsmarket-db
+    databaseName: starsmarket
+    user: starsmarket
+    ipAllowList: []  # только внутренняя сеть Render
+    plan: free  # 1GB, 90 дней бесплатно
+
+  # === Next.js Admin Panel ===
+  - type: web
+    name: starsmarket-admin
+    runtime: docker
+    dockerfilePath: ./Dockerfile.admin
+    plan: free  # 750 часов/мес = 24/7
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: starsmarket-db
+          property: connectionString
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: ADMIN_TG_ID
+        sync: false
+      - key: PLATEGA_MERCHANT_ID
+        sync: false
+      - key: PLATEGA_SECRET
+        sync: false
+      - key: DELIVER_KEY
+        sync: false
+      - key: BOT_INTERNAL_URL
+        value: http://starsmarket-bot:3004  # внутренний URL бота
+
+  # === Telegram Bot ===
+  - type: worker
+    name: starsmarket-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile.bot
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: starsmarket-db
+          property: connectionString
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: ADMIN_TG_ID
+        sync: false
+      - key: SMS_API_KEY
+        sync: false
+      - key: SMM_API_KEY
+        sync: false
+      - key: MTPROTO_API_URL
+        value: http://starsmarket-mtproto:8080
+      - key: MTPROTO_API_KEY
+        sync: false
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: DELIVER_KEY
+        sync: false
+      - key: PORT
+        value: "3004"
+
+  # === MTProto Python Service ===
+  - type: web
+    name: starsmarket-mtproto
+    runtime: docker
+    dockerContext: ./mini-services/mtproto-api
+    dockerfilePath: ./mini-services/mtproto-api/Dockerfile
+    plan: free
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: MTPROTO_API_KEY
+        sync: false

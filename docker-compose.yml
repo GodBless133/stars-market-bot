@@ -1,0 +1,84 @@
+version: "3.8"
+
+services:
+  # === PostgreSQL ===
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: starsmarket
+      POSTGRES_USER: starsmarket
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-starsmarket123}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U starsmarket"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # === Next.js Admin Panel ===
+  admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://starsmarket:${DB_PASSWORD:-starsmarket123}@db:5432/starsmarket
+      BOT_TOKEN: ${BOT_TOKEN}
+      WEBAPP_URL: ${WEBAPP_URL:-http://localhost:3000}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-StarsMarket2025!}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-changeme}
+      ADMIN_TG_ID: ${ADMIN_TG_ID}
+      PLATEGA_MERCHANT_ID: ${PLATEGA_MERCHANT_ID}
+      PLATEGA_SECRET: ${PLATEGA_SECRET}
+      DELIVER_KEY: ${DELIVER_KEY:-changeme}
+      BOT_INTERNAL_URL: http://bot:3004
+    ports:
+      - "3000:3000"
+
+  # === Telegram Bot ===
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://starsmarket:${DB_PASSWORD:-starsmarket123}@db:5432/starsmarket
+      BOT_TOKEN: ${BOT_TOKEN}
+      WEBAPP_URL: ${WEBAPP_URL:-http://localhost:3000}
+      ADMIN_TG_ID: ${ADMIN_TG_ID}
+      SMS_API_KEY: ${SMS_API_KEY}
+      SMM_API_KEY: ${SMM_API_KEY}
+      MTPROTO_API_URL: http://mtproto:8080
+      MTPROTO_API_KEY: ${MTPROTO_API_KEY:-changeme}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      DELIVER_KEY: ${DELIVER_KEY:-changeme}
+      PORT: "3004"
+    ports:
+      - "3004:3004"
+
+  # === MTProto Python Service ===
+  mtproto:
+    build:
+      context: ./mini-services/mtproto-api
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      MTPROTO_API_KEY: ${MTPROTO_API_KEY:-changeme}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
